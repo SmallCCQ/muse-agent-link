@@ -1,1 +1,29 @@
-{"description":"Muse 直连通道插件：让 Muse (Victor) 经 Tailscale 直连本机 DeepSeek Harness，无第三方 IM 中转。状态卡 + 状态接口，通道协议见仓库 protocol/PROTOCOL.md。","dsh":{"bundle":{"patch":"./cordis.patch.yml"},"client":{"immediately":true,"inject":["@deepseek-ai/dsh-client-ui-slots","@deepseek-ai/dsh-client-ui-renderer"],"platform":"web"},"engines":{"dsh":">=0.2.1-rc.3"}},"exports":{".":"./index.js","./client":"./client.js","./icon":"./icon.svg","./package.json":"./package.json"},"main":"./index.js","name":"@local/muse-agent-link","type":"module","version":"0.1.0"}
+{
+  "description": "Muse 直连通道插件：让 Muse (Victor) 经 Tailscale 直连本机 DeepSeek Harness，无第三方 IM 中转。状态卡 + 状态接口，通道协议见仓库 protocol/PROTOCOL.md。",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ],
+      "platform": "web"
+    },
+    "engines": {
+      "dsh": ">=0.2.1-rc.3"
+    }
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "main": "./index.js",
+  "name": "@local/muse-agent-link",
+  "type": "module",
+  "version": "0.1.1"
+}

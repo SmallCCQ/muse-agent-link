@@ -5,7 +5,7 @@ import path from 'node:path'
 export const name = 'muse-agent-link'
 export const inject = ['webServer']
 
-export const VERSION = '0.1.0'
+export const VERSION = '0.1.1'
 
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 const STATE_DIR = path.join(DSH_HOME, 'muse-agent-link')

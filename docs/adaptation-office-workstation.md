@@ -103,7 +103,8 @@
   最终 stopReason=end_turn，回复 AGY_OK。
 - **账号风险解除**：此前 cli.log 里 2026-11-12 的 ToS 封禁 403 已不复现，
   Antigravity 在桌面会话内可正常使用（模型列表含 Gemini 4 Neon / Carbon）。
-- ACP 会话即 Antigravity 的真实 conversation，桌面端可见。
+- （此条已被 2026-11-22 02:34 Cai 的纠正推翻：ACP 会话只存在于
+  `~/.gemini/antigravity-cli` 存储，桌面版 Antigravity 应用不可见。见下方 M2.5。）
 - 待建：常驻 daemon（交互会话内、回环接口）+ 插件侧 antigravity 线程代理（M2 主体）。
 
 ## M2 完成（2026-11-22 02:08，插件 v0.4.0 + daemon v0.1.0）
@@ -128,3 +129,35 @@
   violation of Terms of Service`。这是 10 天前的记录；在交互会话内成功跑一次
   agy 之前，无法确认该账号现在能否正常使用 Antigravity 服务端。
   若封禁仍在，工程做得再对也用不了 Ultra 额度，需要先走申诉。
+
+## M2.5 桌面版改造（2026-11-22，插件 v0.5.0 + daemon v0.2.1）
+
+Cai 纠正：Antigravity 侧必须对接**桌面版应用**，不是 agy CLI。核查证实两套
+存储完全独立（`~/.gemini/antigravity` vs `~/.gemini/antigravity-cli`），
+M2 的 ACP 会话桌面端不可见，daemon 后端整体重写：
+
+- **新建会话**：桌面应用自带 agent 接口
+  `~/.gemini/antigravity/bin/agentapi.bat`（包 language_server.exe），
+  `agentapi new-conversation --title=<t> <prompt>` 立即返回真实桌面
+  conversation id，回合在桌面应用内异步执行。必需环境变量：
+  `ANTIGRAVITY_LS_ADDRESS=http://127.0.0.1:<hub httpPort>`、
+  `ANTIGRAVITY_CSRF_TOKEN=<hub csrfToken>`，取自
+  `~/.gemini/antigravity/daemon/hub_<httpPort>.json`（取 mtime 最新一份）。
+- **追问回合**：`agentapi send-message` 只会往会话里注入一条高优先级
+  SYSTEM_MESSAGE，空闲 cascade 不会为此启动新回合（实测第一追问因 cascade
+  尚热而秒回、其后不再响应）。正确做法是语言服务器的 Connect JSON RPC：
+  `POST http://127.0.0.1:<httpPort>/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage`，
+  头 `x-codeium-csrf-token: <csrfToken>`，体
+  `{"cascadeId": "<id>", "items": [{"text": "..."}]}`，产生真实 USER_INPUT 回合。
+- **回合结果**：轮询桌面会话自有 transcript
+  `~/.gemini/antigravity/brain/<id>/.system_generated/logs/transcript.jsonl`；
+  完成判据 = 基线步之后出现带内容的 PLANNER_RESPONSE(DONE) 且文件静默 ≥4s；
+  轮询的步集是「基线之后全部步」，不能只认 USER_INPUT（追问以 SYSTEM_MESSAGE 入账）。
+- **审批**：桌面端无远程审批接口，`commandExecutionPolicy: "eager"` 下命令自动
+  执行；daemon 只在 transcript 停滞 >120s 时标 awaitingApproval 提示，
+  真正的审批由 Cai 在桌面应用内处理。agentapi 无取消命令，取消只停本地等待。
+- daemon 记录 id 用自有 UUID（provisional），首回合创建桌面会话后把
+  desktopConversationId 落盘到 desktop-conversations.json，插件线程同步展示。
+- 实测：线程 bdd2ea9e… → 桌面会话 80b148d7-e2cd-46fa-a066-036facbc09f7，
+  标题「Muse 直连 · 11-22 02:59」；两轮经完整通道验证 FINAL_OK / FINAL_OK2
+  （第二轮走 RPC 追问）。另手工验证 RPC 直发得 RPC_OK。

@@ -10,7 +10,7 @@ export const name = 'muse-agent-link'
 // injecting it: this Cordis host throws on un-injected property access.
 export const inject = ['webServer', 'connection', 'typertGateway']
 
-export const VERSION = '0.4.0'
+export const VERSION = '0.5.0'
 
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 const STATE_DIR = path.join(DSH_HOME, 'muse-agent-link')
@@ -277,6 +277,7 @@ function saveThreads() {
       id: t.id,
       agent: t.agent || 'dsh',
       sessionId: t.sessionId,
+      desktopConversationId: t.desktopConversationId || null,
       workspace: t.workspace,
       preset: t.preset || null,
       title: t.title || null,
@@ -294,6 +295,7 @@ function threadView(t) {
     id: t.id,
     agent: t.agent || 'dsh',
     sessionId: t.sessionId,
+    desktopConversationId: t.desktopConversationId || null,
     workspace: t.workspace,
     preset: t.preset || null,
     title: t.title || null,
@@ -730,9 +732,15 @@ export function apply(ctx) {
         workspace = resolved
       }
       if (body.agent === 'antigravity') {
+        // The desktop conversation gets a recognisable title in the
+        // Antigravity app, same convention as DSH session renames.
+        const stamp = new Date()
+        const label =
+          (body.title ? String(body.title) : null) ||
+          `Muse 直连 · ${String(stamp.getMonth() + 1).padStart(2, '0')}-${String(stamp.getDate()).padStart(2, '0')} ${String(stamp.getHours()).padStart(2, '0')}:${String(stamp.getMinutes()).padStart(2, '0')}`
         let conv
         try {
-          const data = await daemonCall('POST', '/conversations', { cwd: workspace })
+          const data = await daemonCall('POST', '/conversations', { cwd: workspace, title: label })
           conv = data.conversation
         } catch (err) {
           sendError(res, 502, 'daemon_unavailable', String(err?.message || err))
@@ -742,9 +750,10 @@ export function apply(ctx) {
           id: crypto.randomUUID(),
           agent: 'antigravity',
           sessionId: conv.id,
+          desktopConversationId: null,
           workspace,
           preset: null,
-          title: null,
+          title: label,
           state: 'active',
           createdAt: new Date().toISOString(),
           lastActivityAt: new Date().toISOString(),
@@ -858,6 +867,7 @@ export function apply(ctx) {
             const data = await daemonCall('POST', `/conversations/${t.sessionId}/prompt`, { text: body.text })
             const conv = data.conversation || {}
             t.lastTurn = conv.lastTurn || { status: 'ok', finishedAt: new Date().toISOString(), resultText: '' }
+            if (conv.desktopConversationId) t.desktopConversationId = conv.desktopConversationId
             if (conv.title) t.title = conv.title
             pushThreadEvent(t, 'turn.finished', { status: t.lastTurn.status, resultText: t.lastTurn.resultText || '' })
           } catch (err) {

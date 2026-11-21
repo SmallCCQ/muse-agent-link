@@ -1,19 +1,50 @@
-// Muse Agent Link daemon for Antigravity (office-workstation).
+// Muse Agent Link daemon for the Antigravity DESKTOP app (office-workstation).
 //
-// Runs inside the interactive desktop session (agy can only read its auth
-// there), hosts ONE `agy acp` process, and exposes a loopback-only HTTP API
-// that the DSH plugin proxies to. Conversations created here are real
-// Antigravity conversations, visible in the Antigravity app.
+// Backend history: v0.1.0 drove the `agy` CLI through its ACP server, which
+// created CLI conversations (~/.gemini/antigravity-cli) that never appear in
+// the desktop app. Cai corrected the target on 2026-11-22: the desktop app is
+// the product surface. v0.2.0 therefore drives the desktop app itself through
+// its own agent interface:
+//
+//   - The desktop app runs a language server ("hub") that publishes
+//     ~/.gemini/antigravity/daemon/hub_<httpPort>.json { httpsPort, httpPort,
+//     lsVersion, csrfToken }.
+//   - `language_server.exe agentapi` (wrapped by ~/.gemini/antigravity/bin/
+//     agentapi.bat) talks to that hub when ANTIGRAVITY_LS_ADDRESS is set to
+//     http://127.0.0.1:<httpPort> and ANTIGRAVITY_CSRF_TOKEN to the hub token:
+//       agentapi new-conversation [--model=..] [--title=..] <prompt>
+//       agentapi get-conversation-metadata <conversation_id>
+//     new-conversation returns the real desktop conversation id immediately;
+//     the turn then runs asynchronously inside the desktop app. Follow-up
+//     turns use the LS Connect RPC SendUserCascadeMessage (see lsRpc below):
+//     agentapi's send-message only injects a SYSTEM_MESSAGE, which an idle
+//     cascade never answers.
+//   - Turn results are read from the conversation's own transcript:
+//     ~/.gemini/antigravity/brain/<id>/.system_generated/logs/transcript.jsonl
+//     (JSONL steps: USER_INPUT / PLANNER_RESPONSE / ..., each with status).
+//     A turn is complete when a MODEL PLANNER_RESPONSE step with status DONE
+//     lands after the turn's USER_INPUT step and the transcript goes quiet.
+//
+// The daemon keeps its loopback HTTP API shape (the DSH plugin proxies to
+// it), so the plugin side barely changes. Conversation ids exposed by this
+// API are daemon-local: a record starts as a provisional UUID (agentapi can
+// only create a conversation together with its first prompt) and gains a
+// `desktopConversationId` once the first prompt creates the real thing.
+//
+// Approvals: the desktop app presents tool approvals in its own UI; there is
+// no agentapi surface for them, so /permissions is inert here. A turn that
+// stops producing transcript output for a long while is flagged
+// `awaitingApproval` on the conversation view as a hint.
 //
 // API (Authorization: Bearer <daemon token from daemon-token.txt>):
 //   GET  /status
 //   GET  /conversations
-//   POST /conversations { cwd }                  -> { conversation }
+//   POST /conversations { cwd, title }           -> { conversation }
 //   GET  /conversations/:id
 //   POST /conversations/:id/prompt { text }      -> blocks until turn end
-//   POST /conversations/:id/cancel
-//   GET  /permissions                            -> pending permission requests
-//   POST /permissions/:id { optionId }           -> decide
+//   POST /conversations/:id/cancel               -> stops waiting locally
+//   GET  /permissions                            -> always empty (see above)
+//   POST /permissions/:id                        -> 410
 import { spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -21,14 +52,26 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.1'
 const PORT = 47615
 const HOST = '127.0.0.1'
 const STATE_DIR = path.join(os.homedir(), '.dsh', 'muse-agent-link')
 const TOKEN_PATH = path.join(STATE_DIR, 'daemon-token.txt')
-const INDEX_PATH = path.join(STATE_DIR, 'agy-conversations.json')
+const INDEX_PATH = path.join(STATE_DIR, 'desktop-conversations.json')
 const LOG_PATH = path.join(STATE_DIR, 'daemon.log')
-const AGY = path.join(process.env.LOCALAPPDATA || '', 'agy', 'bin', 'agy.exe')
+const AGY_HOME = path.join(os.homedir(), '.gemini', 'antigravity')
+const HUB_DIR = path.join(AGY_HOME, 'daemon')
+const BRAIN_DIR = path.join(AGY_HOME, 'brain')
+const LS_EXE = path.join(
+  process.env.LOCALAPPDATA || '',
+  'Programs',
+  'antigravity',
+  'resources',
+  'bin',
+  'language_server.exe',
+)
+const DEFAULT_TURN_TIMEOUT_MS = 600_000
+const STALL_HINT_MS = 120_000
 
 function log(line) {
   const msg = `${new Date().toISOString()} ${line}\n`
@@ -74,138 +117,178 @@ function saveIndex() {
   } catch {}
 }
 
-// ---------- agy ACP process ----------
-
-let acp = null // { child, nextId, pending: Map, buffer }
-const loadedSessions = new Set()
-const turnCollectors = new Map() // sessionId -> { text, resolve }
-const pendingPermissions = new Map() // permId -> { sessionId, options, rpcId, createdAt }
-
-function startAcp() {
-  const child = spawn(AGY, ['acp'], { cwd: os.homedir(), windowsHide: true })
-  const proc = { child, nextId: 1, pending: new Map(), buffer: '' }
-  acp = proc
-  loadedSessions.clear()
-  child.stdout.on('data', (d) => {
-    proc.buffer += d.toString()
-    let idx
-    while ((idx = proc.buffer.indexOf('\n')) >= 0) {
-      const line = proc.buffer.slice(0, idx).trim()
-      proc.buffer = proc.buffer.slice(idx + 1)
-      if (line) handleAcpMessage(proc, line)
-    }
-  })
-  child.stderr.on('data', (d) => log(`agy stderr: ${d.toString().slice(0, 300)}`))
-  child.on('error', (e) => log(`agy spawn error: ${e.message}`))
-  child.on('close', (code) => {
-    log(`agy exited (${code}); will restart on next request`)
-    for (const p of proc.pending.values()) p.reject(new Error('agy exited'))
-    proc.pending.clear()
-    if (acp === proc) acp = null
-  })
-  log('agy acp started')
-  return proc
+function findConversation(id) {
+  if (conversations.has(id)) return conversations.get(id)
+  for (const c of conversations.values()) if (c.desktopConversationId === id) return c
+  return null
 }
 
-async function ensureAcp() {
-  if (!acp) {
-    const proc = startAcp()
-    await acpRequest(proc, 'initialize', {
-      protocolVersion: 1,
-      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-      clientInfo: { name: 'muse-agent-link-daemon', version: VERSION },
-    })
-    log('agy initialize ok')
-  }
-  return acp
-}
+// ---------- desktop hub + agentapi ----------
 
-function acpSend(proc, obj) {
-  proc.child.stdin.write(JSON.stringify(obj) + '\n')
-}
-
-function acpRequest(proc, method, params) {
-  const id = proc.nextId++
-  return new Promise((resolve, reject) => {
-    proc.pending.set(id, { resolve, reject })
-    acpSend(proc, { jsonrpc: '2.0', id, method, params })
-  })
-}
-
-function handleAcpMessage(proc, line) {
-  let msg
+function hubInfo() {
+  let files = []
   try {
-    msg = JSON.parse(line)
-  } catch {
-    return
+    files = fs
+      .readdirSync(HUB_DIR)
+      .filter((f) => /^hub_\d+\.json$/.test(f))
+      .map((f) => ({ f, mtime: fs.statSync(path.join(HUB_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime)
+  } catch {}
+  for (const { f } of files) {
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(HUB_DIR, f), 'utf8'))
+      if (j.httpPort && j.csrfToken) return j
+    } catch {}
   }
-  if (msg.id !== undefined && proc.pending.has(msg.id)) {
-    const p = proc.pending.get(msg.id)
-    proc.pending.delete(msg.id)
-    if (msg.error) p.reject(new Error(JSON.stringify(msg.error).slice(0, 400)))
-    else p.resolve(msg.result)
-    return
-  }
-  if (msg.method === 'session/update') {
-    const { sessionId, update } = msg.params || {}
-    const conv = conversations.get(sessionId)
-    if (conv && update?.sessionUpdate === 'session_info_update' && update.title) {
-      conv.title = update.title
-      saveIndex()
-    }
-    const collector = turnCollectors.get(sessionId)
-    if (collector && update?.sessionUpdate === 'agent_message_chunk') {
-      const text = update.content?.type === 'text' ? update.content.text : ''
-      if (text) collector.text += text
-    }
-    return
-  }
-  if (msg.method && msg.id !== undefined) {
-    // Agent -> client request. Permission requests are held for the
-    // controller (via the DSH plugin) to decide; anything else gets a
-    // minimal refusal so the agent is never blocked on us.
-    if (msg.method === 'session/request_permission') {
-      const permId = crypto.randomUUID()
-      pendingPermissions.set(permId, {
-        id: permId,
-        sessionId: msg.params?.sessionId || null,
-        toolCall: msg.params?.toolCall || null,
-        options: msg.params?.options || [],
-        rpcId: msg.id,
-        proc,
-        createdAt: new Date().toISOString(),
-      })
-      log(`permission requested ${permId} for session ${msg.params?.sessionId}`)
+  return null
+}
+
+function agentapi(args, timeoutMs = 30_000) {
+  return new Promise((resolve, reject) => {
+    const hub = hubInfo()
+    if (!hub) {
+      reject(new Error('no Antigravity desktop hub found (is the desktop app running?)'))
       return
     }
-    acpSend(proc, {
-      jsonrpc: '2.0',
-      id: msg.id,
-      error: { code: -32601, message: `unsupported client method: ${msg.method}` },
+    const child = spawn(LS_EXE, ['agentapi', ...args], {
+      windowsHide: true,
+      env: {
+        ...process.env,
+        ANTIGRAVITY_LS_ADDRESS: `http://127.0.0.1:${hub.httpPort}`,
+        ANTIGRAVITY_CSRF_TOKEN: hub.csrfToken,
+      },
     })
+    let out = ''
+    let err = ''
+    const timer = setTimeout(() => {
+      child.kill()
+      reject(new Error(`agentapi ${args[0]} timed out`))
+    }, timeoutMs)
+    child.stdout.on('data', (d) => (out += d.toString()))
+    child.stderr.on('data', (d) => (err += d.toString()))
+    child.on('error', (e) => {
+      clearTimeout(timer)
+      reject(e)
+    })
+    child.on('close', () => {
+      clearTimeout(timer)
+      const start = out.indexOf('{')
+      const end = out.lastIndexOf('}')
+      if (start < 0 || end <= start) {
+        reject(new Error(`agentapi ${args[0]}: no JSON in output: ${(out || err).slice(0, 300)}`))
+        return
+      }
+      let parsed
+      try {
+        parsed = JSON.parse(out.slice(start, end + 1))
+      } catch (e) {
+        reject(new Error(`agentapi ${args[0]}: bad JSON: ${e.message}`))
+        return
+      }
+      if (parsed.error) {
+        reject(new Error(`agentapi ${args[0]}: ${typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error).slice(0, 300)}`))
+        return
+      }
+      resolve(parsed.response || {})
+    })
+  })
+}
+
+// Follow-up user turns go through the language server's own RPC, not
+// agentapi: `agentapi send-message` only injects a SYSTEM_MESSAGE into the
+// conversation, which an idle cascade never answers (verified live
+// 2026-11-22). The LS serves Connect-protocol JSON on the hub httpPort;
+// SendUserCascadeMessage with header x-codeium-csrf-token creates a real
+// USER_INPUT turn in an existing conversation.
+async function lsRpc(method, body) {
+  const hub = hubInfo()
+  if (!hub) throw new Error('no Antigravity desktop hub found (is the desktop app running?)')
+  const res = await fetch(
+    `http://127.0.0.1:${hub.httpPort}/exa.language_server_pb.LanguageServerService/${method}`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-codeium-csrf-token': hub.csrfToken },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    },
+  )
+  const text = await res.text()
+  if (!res.ok) throw new Error(`LS ${method} HTTP ${res.status}: ${text.slice(0, 300)}`)
+  try {
+    return JSON.parse(text)
+  } catch {
+    return {}
   }
 }
 
-async function ensureSessionLoaded(conv) {
-  const proc = await ensureAcp()
-  if (loadedSessions.has(conv.id)) return proc
+// ---------- transcript watching ----------
+
+function transcriptPath(desktopId) {
+  return path.join(BRAIN_DIR, desktopId, '.system_generated', 'logs', 'transcript.jsonl')
+}
+
+function readSteps(desktopId) {
   try {
-    await acpRequest(proc, 'session/load', {
-      sessionId: conv.id,
-      cwd: conv.cwd,
-      mcpServers: [],
-    })
+    const raw = fs.readFileSync(transcriptPath(desktopId), 'utf8')
+    const steps = []
+    for (const line of raw.split('\n')) {
+      const t = line.trim()
+      if (!t) continue
+      try {
+        steps.push(JSON.parse(t))
+      } catch {}
+    }
+    return steps
   } catch {
-    // A brand-new conversation is already live in its creating process; after
-    // a daemon/agy restart, load is the path. If load fails, surface it.
-    if (conv.fresh) {
-      conv.fresh = false
-    } else {
-      throw new Error(`session/load failed for ${conv.id}`)
+    return []
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const runningTurns = new Map() // daemon conv id -> { cancelled: boolean }
+
+async function waitForTurn(conv, baselineMaxStep, timeoutMs) {
+  const desktopId = conv.desktopConversationId
+  const startedAt = Date.now()
+  let lastSize = -1
+  let lastChangeAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    const ctl = runningTurns.get(conv.id)
+    if (ctl?.cancelled) return { status: 'cancelled', resultText: '' }
+    await sleep(1500)
+    let size = -1
+    try {
+      size = fs.statSync(transcriptPath(desktopId)).size
+    } catch {}
+    if (size !== lastSize) {
+      lastSize = size
+      lastChangeAt = Date.now()
+      conv.awaitingApproval = false
+    } else if (Date.now() - lastChangeAt > STALL_HINT_MS) {
+      // No transcript movement for a while: the desktop app may be waiting
+      // for Cai to approve something in its UI. Hint only; keep waiting.
+      conv.awaitingApproval = true
+    }
+    const steps = readSteps(desktopId)
+    // The turn's steps are everything past the pre-dispatch baseline. Do not
+    // key on a USER_INPUT step: new-conversation produces one, but
+    // send-message delivers follow-ups as SYSTEM_MESSAGE steps instead
+    // (observed live 2026-11-22), and the model answers them the same way.
+    const turnSteps = steps.filter((s) => s.step_index > baselineMaxStep)
+    if (!turnSteps.length) continue
+    const errorStep = turnSteps.find((s) => s.status === 'ERROR')
+    if (errorStep) {
+      return { status: 'failed', resultText: '', error: String(errorStep.error_details || errorStep.content || 'step error').slice(0, 500) }
+    }
+    const replies = turnSteps.filter(
+      (s) => s.type === 'PLANNER_RESPONSE' && s.status === 'DONE' && typeof s.content === 'string' && s.content.trim(),
+    )
+    const quiet = Date.now() - lastChangeAt >= 4000
+    if (replies.length && quiet) {
+      return { status: 'ok', resultText: replies[replies.length - 1].content.trim().slice(-4000) }
     }
   }
-  loadedSessions.add(conv.id)
-  return proc
+  return { status: 'timeout', resultText: '', error: `turn did not finish within ${Math.round(timeoutMs / 1000)}s` }
 }
 
 // ---------- http api ----------
@@ -225,11 +308,13 @@ async function readBody(req) {
 function convView(c) {
   return {
     id: c.id,
+    desktopConversationId: c.desktopConversationId || null,
     cwd: c.cwd,
     title: c.title || null,
     createdAt: c.createdAt,
     lastTurn: c.lastTurn || null,
-    busy: turnCollectors.has(c.id),
+    busy: runningTurns.has(c.id),
+    awaitingApproval: Boolean(c.awaitingApproval),
   }
 }
 
@@ -238,12 +323,15 @@ const server = http.createServer(async (req, res) => {
   const parts = url.pathname.split('/').filter(Boolean)
   try {
     if (url.pathname === '/status' && req.method === 'GET') {
+      const hub = hubInfo()
       sendJson(res, 200, {
         ok: true,
         daemon: 'muse-agent-link',
         version: VERSION,
+        backend: 'antigravity-desktop',
         machine: os.hostname(),
-        acpRunning: Boolean(acp),
+        hubPort: hub?.httpPort || null,
+        lsVersion: hub?.lsVersion || null,
         conversations: conversations.size,
         time: new Date().toISOString(),
       })
@@ -266,21 +354,27 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, { error: { code: 'cwd_not_found', message: `cwd does not exist: ${cwd}` } })
         return
       }
-      const proc = await ensureAcp()
-      const result = await acpRequest(proc, 'session/new', { cwd, mcpServers: [] })
-      const id = result?.sessionId
-      if (!id) throw new Error('session/new returned no sessionId')
-      const conv = { id, cwd, title: null, createdAt: new Date().toISOString(), lastTurn: null, fresh: true }
-      conversations.set(id, conv)
-      loadedSessions.add(id)
+      // agentapi creates a conversation only together with its first prompt,
+      // so this record starts provisional; the desktop conversation appears
+      // on the first /prompt call.
+      const conv = {
+        id: crypto.randomUUID(),
+        desktopConversationId: null,
+        cwd,
+        title: body.title ? String(body.title) : null,
+        createdAt: new Date().toISOString(),
+        lastTurn: null,
+        awaitingApproval: false,
+      }
+      conversations.set(conv.id, conv)
       saveIndex()
-      log(`conversation created ${id} in ${cwd}`)
+      log(`conversation record created ${conv.id} (provisional, cwd ${cwd})`)
       sendJson(res, 201, { ok: true, conversation: convView(conv) })
       return
     }
 
     if (parts[0] === 'conversations' && parts[1] && parts.length === 2 && req.method === 'GET') {
-      const conv = conversations.get(parts[1])
+      const conv = findConversation(parts[1])
       if (!conv) {
         sendJson(res, 404, { error: { code: 'not_found', message: 'conversation not found' } })
         return
@@ -290,12 +384,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (parts[0] === 'conversations' && parts[2] === 'prompt' && req.method === 'POST') {
-      const conv = conversations.get(parts[1])
+      const conv = findConversation(parts[1])
       if (!conv) {
         sendJson(res, 404, { error: { code: 'not_found', message: 'conversation not found' } })
         return
       }
-      if (turnCollectors.has(conv.id)) {
+      if (runningTurns.has(conv.id)) {
         sendJson(res, 409, { error: { code: 'busy', message: 'a turn is already running' } })
         return
       }
@@ -304,19 +398,37 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, { error: { code: 'bad_request', message: 'text is required' } })
         return
       }
-      const proc = await ensureSessionLoaded(conv)
-      const collector = { text: '' }
-      turnCollectors.set(conv.id, collector)
+      const timeoutMs = Math.min(Math.max(Number(body.timeoutMs) || DEFAULT_TURN_TIMEOUT_MS, 30_000), 900_000)
+      runningTurns.set(conv.id, { cancelled: false })
       try {
-        const result = await acpRequest(proc, 'session/prompt', {
-          sessionId: conv.id,
-          prompt: [{ type: 'text', text: body.text }],
-        })
+        let baseline = -1
+        if (!conv.desktopConversationId) {
+          const args = ['new-conversation']
+          if (conv.title) args.push(`--title=${conv.title}`)
+          args.push(body.text)
+          const resp = await agentapi(args)
+          const newId = resp?.newConversation?.conversationId
+          if (!newId) throw new Error('new-conversation returned no conversationId')
+          conv.desktopConversationId = newId
+          saveIndex()
+          log(`desktop conversation created ${newId} for record ${conv.id}`)
+        } else {
+          baseline = readSteps(conv.desktopConversationId).reduce((m, s) => Math.max(m, s.step_index ?? -1), -1)
+          await lsRpc('SendUserCascadeMessage', {
+            cascadeId: conv.desktopConversationId,
+            items: [{ text: body.text }],
+          })
+        }
+        const outcome = await waitForTurn(conv, baseline, timeoutMs)
         conv.lastTurn = {
-          status: 'ok',
-          stopReason: result?.stopReason || null,
+          status: outcome.status,
+          stopReason: outcome.status === 'ok' ? 'end_turn' : null,
           finishedAt: new Date().toISOString(),
-          resultText: collector.text.trim().slice(-4000),
+          resultText: outcome.resultText || '',
+          ...(outcome.error ? { error: outcome.error } : {}),
+          ...(outcome.status === 'cancelled'
+            ? { error: 'wait cancelled locally; the desktop agent may still finish the turn in the app' }
+            : {}),
         }
       } catch (err) {
         conv.lastTurn = {
@@ -326,7 +438,8 @@ const server = http.createServer(async (req, res) => {
           error: String(err?.message || err),
         }
       } finally {
-        turnCollectors.delete(conv.id)
+        conv.awaitingApproval = false
+        runningTurns.delete(conv.id)
         saveIndex()
       }
       sendJson(res, 200, { ok: true, conversation: convView(conv) })
@@ -334,51 +447,29 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (parts[0] === 'conversations' && parts[2] === 'cancel' && req.method === 'POST') {
-      const conv = conversations.get(parts[1])
+      const conv = findConversation(parts[1])
       if (!conv) {
         sendJson(res, 404, { error: { code: 'not_found', message: 'conversation not found' } })
         return
       }
-      const proc = await ensureAcp()
-      acpSend(proc, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: conv.id } })
+      // agentapi has no cancel: stop waiting locally. The turn itself may
+      // still complete inside the desktop app.
+      const ctl = runningTurns.get(conv.id)
+      if (ctl) ctl.cancelled = true
       sendJson(res, 200, { ok: true })
       return
     }
 
     if (url.pathname === '/permissions' && req.method === 'GET') {
-      sendJson(res, 200, {
-        ok: true,
-        permissions: [...pendingPermissions.values()].map((p) => ({
-          id: p.id,
-          sessionId: p.sessionId,
-          toolCall: p.toolCall,
-          options: p.options,
-          createdAt: p.createdAt,
-        })),
-      })
+      // The desktop app owns approvals in its own UI; nothing to mirror.
+      sendJson(res, 200, { ok: true, permissions: [] })
       return
     }
 
     if (parts[0] === 'permissions' && parts[1] && req.method === 'POST') {
-      const pending = pendingPermissions.get(parts[1])
-      if (!pending) {
-        sendJson(res, 410, { error: { code: 'gone', message: 'permission no longer pending' } })
-        return
-      }
-      const body = await readBody(req)
-      const optionId = String(body.optionId || '')
-      if (!pending.options.some((o) => o.optionId === optionId)) {
-        sendJson(res, 400, { error: { code: 'bad_option', message: 'optionId not offered' } })
-        return
-      }
-      pendingPermissions.delete(parts[1])
-      acpSend(pending.proc, {
-        jsonrpc: '2.0',
-        id: pending.rpcId,
-        result: { outcome: { outcome: 'selected', optionId } },
+      sendJson(res, 410, {
+        error: { code: 'gone', message: 'the desktop app handles approvals in its own UI' },
       })
-      log(`permission ${parts[1]} decided -> ${optionId}`)
-      sendJson(res, 200, { ok: true })
       return
     }
 
@@ -390,5 +481,5 @@ const server = http.createServer(async (req, res) => {
 })
 
 server.listen(PORT, HOST, () => {
-  log(`daemon v${VERSION} listening on http://${HOST}:${PORT} (machine ${os.hostname()})`)
+  log(`daemon v${VERSION} listening on http://${HOST}:${PORT} (machine ${os.hostname()}, backend antigravity-desktop)`)
 })

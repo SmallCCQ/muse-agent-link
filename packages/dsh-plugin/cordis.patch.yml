@@ -1,8 +1,4 @@
-# Example profile patch for the Muse Link DSH plugin.
-# Management RPC stays loopback-only; the workspace allowlist starts empty
-# (deny-all) and is filled in per machine during pairing.
-- id: muse-agent-link
-  config:
-    rpcAuthority: loopback
-    workspaceAllowlist: []
-    concurrencyLimit: 2
+- insert:
+    - id: muse-agent-link
+      name: '@local/muse-agent-link'
+      config: {}

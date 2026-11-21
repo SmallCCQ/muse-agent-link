@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+
+# Local runtime state — never commit tokens, ledgers or audit logs
+.muse-agent-link/
+state/
+pairing.json
+device-token*
+
+.env
+.env.*

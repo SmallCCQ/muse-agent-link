@@ -1,0 +1,1 @@
+{"bin":{"muse-link-daemon":"src/index.ts"},"description":"Machine-side daemon: serves the Muse Link channel endpoint (tailnet-only bind), pairing/token auth, thread & job ledger, audit log, and the Antigravity (agy) adapter.","license":"MIT","main":"src/index.ts","name":"@muse-agent-link/daemon","private":true,"scripts":{"check":"tsc --noEmit"},"type":"module","version":"0.0.1"}

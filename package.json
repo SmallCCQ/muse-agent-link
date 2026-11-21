@@ -1,0 +1,1 @@
+{"description":"Direct-connect channel between Muse (Victor) and local DeepSeek Harness / Antigravity agents over Tailscale. No IM bot relay.","engines":{"node":">=22"},"license":"MIT","name":"muse-agent-link","private":true,"scripts":{"check":"npm run check --workspaces --if-present"},"type":"module","version":"0.0.1","workspaces":["packages/*"]}

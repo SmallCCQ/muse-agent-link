@@ -1,0 +1,1 @@
+{"description":"DSH (DeepSeek Harness) plugin: registers the single 'Muse Link' channel inside the Harness host. Baseline host: DSH 0.2.1-rc.2 (session format v4).","license":"MIT","main":"src/index.ts","name":"@muse-agent-link/dsh-plugin","private":true,"scripts":{"check":"tsc --noEmit"},"type":"module","version":"0.0.1"}

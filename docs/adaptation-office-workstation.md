@@ -42,10 +42,13 @@
   `dsh --profile web --dump-config` 确认插件已组合进配置树。
 - 功能 v0.1.0：侧边栏底部「Muse 直连」状态卡（client.js）+
   `GET /api/muse-agent-link/status` 状态接口（index.js，inject webServer）。
-- 未完成验证：本机已有一个 2026-11-21 18:34 启动的 DSH web 宿主在跑（:3080，
-  带访问鉴权），它早于本次安装，不含本插件；另起的测试实例因端口冲突退出。
-  **需重启 DSH 宿主后插件才真正加载**，状态文件 `~/.dsh/muse-agent-link/state.json`
-  会在首次加载时生成。重启会中断正在进行的会话，故留给 Cai 决定时机。
+- 加载验证（2026-11-22 01:03，Cai 授权后由 Victor 执行重启）：旧宿主
+  （2026-11-21 18:34 启动，:3080）进程树已结束，经 schtasks /IT 在交互会话
+  （session 1）按原命令重拉 `dsh web`；新宿主 pid 31056 监听 3080，
+  启动日志出现 `[muse-agent-link] v0.1.0 loaded on DESKTOP-PRNM1F1 (paired=false)`，
+  插件状态文件 `~/.dsh/muse-agent-link/state.json` 已生成。插件加载确认完成。
+  注：PowerShell 的 ScheduledTask cmdlet 从 SSH 会话注册的交互任务不执行，
+  必须用 schtasks.exe /IT——后续机器侧操作按此办理。
 
 ## 待确认风险
 

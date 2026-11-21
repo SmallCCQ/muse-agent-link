@@ -115,6 +115,35 @@ def main():
     elif cmd == "jobs":
         status, data = request("GET", "/tasks", None, load_token())
         print("HTTP", status, json.dumps(data, ensure_ascii=False, indent=2))
+    elif cmd == "thread-create":
+        body = {}
+        if len(sys.argv) > 2:
+            body["workspace"] = sys.argv[2]
+        status, data = request("POST", "/threads", body, load_token())
+        print("HTTP", status, json.dumps(data, ensure_ascii=False, indent=2))
+    elif cmd == "threads":
+        status, data = request("GET", "/threads", None, load_token())
+        print("HTTP", status, json.dumps(data, ensure_ascii=False, indent=2))
+    elif cmd == "thread":
+        status, data = request("GET", f"/thread?id={sys.argv[2]}", None, load_token())
+        print("HTTP", status, json.dumps(data, ensure_ascii=False, indent=2))
+    elif cmd == "thread-send":
+        body = {"threadId": sys.argv[2], "text": sys.argv[3]}
+        if len(sys.argv) > 4:
+            body["mode"] = sys.argv[4]
+        status, data = request("POST", "/thread-message", body, load_token())
+        print("HTTP", status, json.dumps(data, ensure_ascii=False, indent=2))
+    elif cmd == "thread-events":
+        cursor = sys.argv[3] if len(sys.argv) > 3 else "0"
+        status, data = request("GET", f"/thread-events?id={sys.argv[2]}&cursor={cursor}", None, load_token())
+        print("HTTP", status, json.dumps(data, ensure_ascii=False, indent=2))
+    elif cmd == "thread-stop":
+        status, data = request("POST", f"/thread-stop?id={sys.argv[2]}", {}, load_token())
+        print("HTTP", status, json.dumps(data, ensure_ascii=False, indent=2))
+    elif cmd == "approve":
+        decision = sys.argv[3] if len(sys.argv) > 3 else "approve_once"
+        status, data = request("POST", "/approvals", {"id": sys.argv[2], "decision": decision}, load_token())
+        print("HTTP", status, json.dumps(data, ensure_ascii=False))
     elif cmd == "unpair":
         status, data = request("POST", "/unpair", {}, load_token())
         print("HTTP", status, json.dumps(data, ensure_ascii=False))

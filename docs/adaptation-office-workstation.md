@@ -70,6 +70,42 @@
   宿主内部 Gateway，属 M1.5；Antigravity 属 M2。当前 headless 任务内的工具
   权限遵循 headless profile 自身的 permission preset。
 
+## M1.5 交互会话打通（2026-11-22 01:54，插件 v0.3.2）
+
+- 结论：经 Muse 派发的任务现在跑在宿主的**真实 Session** 里，与 DSH 界面里
+  手工开的会话完全一致（同一目录、同一历史、可在 UI 里继续聊）。
+- 路径（照 dsh-im 的做法）：插件静态注入 `connection` + `typertGateway`，
+  `connection.createPeer({principal:{kind:'owner'}, interactions:'none'})` 建 peer，
+  全部操作走 `typertGateway.invoke({namespace:'session', method, args:{request}, peer})`：
+  create {cwd, agentPreset?} → {sessionId}；prompt {requestId, sessionId, mode, content:[{type:'text',text}]}；
+  wait {sessionId, timeoutMs, afterSeq, maxMessages} → {reason: idle|input-required|timeout, output.records}；
+  rename {sessionId, title}；cancel {sessionId}。
+- 结果文本以 `session/event` 流的 `assistant/message` 事件为准
+  （data.message.content 里 {type:'text'} 拼接）；wait 的 records 形状不同，未作主源。
+- 创建后即 rename 为「Muse 直连 · MM-DD HH:mm」，方便机主在 UI 里辨认。
+- 审批：插件以 prepend 全局挂 `approval/request` 中间件，只处理自有线程的会话，
+  与本地 UI 竞速、先到先决（与 dsh-im 同规则），其余会话直接 next() 放行；
+  10 分钟未决自动拒绝。本轮未实测审批竞速（待真实工具审批场景验证）。
+- 踩坑三则：① Cordis 未注入的 ctx.<service> 属性访问会直接抛错，插件整体加载失败，
+  只能用静态 inject 或 ctx.inject；② `ctx.sessions` 客户端门面在本机 create 时
+  报 header id 不匹配（品牌化 id 对象），宿主侧正道是 Gateway，不要用该门面建会话；
+  ③ webServer 'prefix' 路由不匹配 API 子路径（见 M1 记录）。
+- 实测：线程 095775ce… → session-809841ec-47c2-4d5b-bb9f-fcd6c84c04bd，
+  第一轮回复 SESSION_OK；宿主重启后同一线程第二轮能答出上一轮的口令，
+  证明会话连续性与持久化都成立。
+
+## M2 探活：Antigravity ACP 可用（2026-11-22 01:56）
+
+- 探针 `packages/daemon/acp-probe.mjs` 在交互桌面会话内拉起 `agy acp`（stdio JSON-RPC）：
+  initialize 成功（protocolVersion 1，支持 loadSession/list/resume/close）；
+  session/new 得 conversation 3d445867-ae33-4c68-8b43-b78cb661b619；
+  session/prompt 流式返回 session/update（标题自动生成、tool_call、agent_message_chunk），
+  最终 stopReason=end_turn，回复 AGY_OK。
+- **账号风险解除**：此前 cli.log 里 2026-11-12 的 ToS 封禁 403 已不复现，
+  Antigravity 在桌面会话内可正常使用（模型列表含 Gemini 4 Neon / Carbon）。
+- ACP 会话即 Antigravity 的真实 conversation，桌面端可见。
+- 待建：常驻 daemon（交互会话内、回环接口）+ 插件侧 antigravity 线程代理（M2 主体）。
+
 ## 待确认风险
 
 - `~/.gemini/antigravity-cli/cli.log` 显示 **2026-11-12** 有多次

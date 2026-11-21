@@ -106,6 +106,21 @@
 - ACP 会话即 Antigravity 的真实 conversation，桌面端可见。
 - 待建：常驻 daemon（交互会话内、回环接口）+ 插件侧 antigravity 线程代理（M2 主体）。
 
+## M2 完成（2026-11-22 02:08，插件 v0.4.0 + daemon v0.1.0）
+
+- daemon：`packages/daemon/daemon.mjs` 部署在 `~/.dsh/muse-agent-link/daemon.mjs`，
+  登录计划任务 `MuseAgentLinkDaemon`（/IT 交互会话）自启，常驻托管一个 `agy acp` 进程；
+  回环 API 127.0.0.1:47615，自有令牌（daemon-token.txt，与插件同机读取）。
+  会话索引落盘 agy-conversations.json；daemon/agy 重启后用 session/load 恢复。
+- 插件 v0.4.0：线程加 `agent` 字段；`agent:'antigravity'` 的线程创建/发消息/停止
+  全部代理到 daemon，线程状态机与 DSH 线程一致。
+- 审批闭环实测：agy 每轮会调用其 custom-models MCP 并触发 ACP
+  `session/request_permission`；daemon 挂起 → 插件镜像为线程 pendingApproval →
+  Victor 经 /approvals 批准（allow_once → optionId 'allow'）→ 回合继续完成。
+- 实测：线程 b88e7064… → conversation bad21b18-7179-48c7-8863-eccffbc31391，
+  两轮对话连续，第二轮正确答出第一轮口令 AGY_THREAD_OK。
+- 已知小缺：插件线程视图里 agy 会话标题未同步（Antigravity 应用内标题正常）。
+
 ## 待确认风险
 
 - `~/.gemini/antigravity-cli/cli.log` 显示 **2026-11-12** 有多次

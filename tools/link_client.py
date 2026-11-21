@@ -115,8 +115,10 @@ def main():
     elif cmd == "jobs":
         status, data = request("GET", "/tasks", None, load_token())
         print("HTTP", status, json.dumps(data, ensure_ascii=False, indent=2))
-    elif cmd == "thread-create":
+    elif cmd in ("thread-create", "thread-create-agy"):
         body = {}
+        if cmd == "thread-create-agy":
+            body["agent"] = "antigravity"
         if len(sys.argv) > 2:
             body["workspace"] = sys.argv[2]
         status, data = request("POST", "/threads", body, load_token())

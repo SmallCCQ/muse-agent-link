@@ -10,7 +10,7 @@ export const name = 'muse-agent-link'
 // injecting it: this Cordis host throws on un-injected property access.
 export const inject = ['webServer', 'connection', 'typertGateway']
 
-export const VERSION = '0.3.2'
+export const VERSION = '0.4.0'
 
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 const STATE_DIR = path.join(DSH_HOME, 'muse-agent-link')
@@ -275,6 +275,7 @@ function saveThreads() {
     fs.mkdirSync(STATE_DIR, { recursive: true })
     const arr = [...threads.values()].map((t) => ({
       id: t.id,
+      agent: t.agent || 'dsh',
       sessionId: t.sessionId,
       workspace: t.workspace,
       preset: t.preset || null,
@@ -291,6 +292,7 @@ function saveThreads() {
 function threadView(t) {
   return {
     id: t.id,
+    agent: t.agent || 'dsh',
     sessionId: t.sessionId,
     workspace: t.workspace,
     preset: t.preset || null,
@@ -299,16 +301,29 @@ function threadView(t) {
     createdAt: t.createdAt,
     lastActivityAt: t.lastActivityAt,
     lastTurn: t.lastTurn || null,
-    pendingApprovals: [...pendingApprovals.values()]
-      .filter((p) => p.threadId === t.id)
-      .map((p) => ({
-        id: p.id,
-        toolName: p.toolName,
-        reason: p.reason || null,
-        workspace: t.workspace,
-        risk: p.risk || 'normal',
-        expiresAt: p.expiresAt,
-      })),
+    pendingApprovals: [
+      ...[...pendingApprovals.values()]
+        .filter((p) => p.threadId === t.id)
+        .map((p) => ({
+          id: p.id,
+          toolName: p.toolName,
+          reason: p.reason || null,
+          workspace: t.workspace,
+          risk: p.risk || 'normal',
+          expiresAt: p.expiresAt,
+        })),
+      ...[...agyPermissions.entries()]
+        .filter(([, p]) => p.threadId === t.id)
+        .map(([id, p]) => ({
+          id,
+          toolName: p.toolName,
+          reason: null,
+          workspace: t.workspace,
+          risk: 'normal',
+          expiresAt: null,
+          agent: 'antigravity',
+        })),
+    ],
   }
 }
 
@@ -328,6 +343,74 @@ function debugCapture(sessionId, event) {
     const line = JSON.stringify(event) + '\n'
     const size = fs.existsSync(file) ? fs.statSync(file).size : 0
     if (size < 512 * 1024) fs.appendFileSync(file, line)
+  } catch {}
+}
+
+
+// ---------- Antigravity daemon client (loopback, same machine) ----------
+
+const DAEMON_PORT = 47615
+const DAEMON_TOKEN_PATH = path.join(STATE_DIR, 'daemon-token.txt')
+
+function daemonToken() {
+  try {
+    return fs.readFileSync(DAEMON_TOKEN_PATH, 'utf8').trim()
+  } catch {
+    return null
+  }
+}
+
+async function daemonCall(method, pathname, body) {
+  const token = daemonToken()
+  if (!token) throw new Error('daemon token not found (daemon not started yet)')
+  const payload = body === undefined ? null : JSON.stringify(body)
+  const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}${pathname}`, {
+    method,
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(payload ? { 'content-type': 'application/json' } : {}),
+    },
+    body: payload,
+    signal: AbortSignal.timeout(30 * 60 * 1000),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data?.error?.message || `daemon HTTP ${res.status}`)
+  return data
+}
+
+// Pending Antigravity permission requests, mirrored from the daemon:
+// permId -> { threadId, options, toolName }
+const agyPermissions = new Map()
+
+async function refreshAgyPermissions() {
+  try {
+    const data = await daemonCall('GET', '/permissions')
+    const seen = new Set()
+    for (const perm of data.permissions || []) {
+      seen.add(perm.id)
+      const threadId = threadsBySession.get(perm.sessionId)
+      if (!threadId) continue
+      if (!agyPermissions.has(perm.id)) {
+        agyPermissions.set(perm.id, {
+          threadId,
+          options: perm.options || [],
+          toolName: perm.toolCall?.title || perm.toolCall?.kind || 'tool',
+        })
+        const t = threads.get(threadId)
+        if (t) {
+          t.state = 'awaiting_approval'
+          pushThreadEvent(t, 'approval.requested', {
+            id: perm.id,
+            toolName: agyPermissions.get(perm.id).toolName,
+            reason: null,
+            agent: 'antigravity',
+          })
+        }
+      }
+    }
+    for (const id of [...agyPermissions.keys()]) {
+      if (!seen.has(id)) agyPermissions.delete(id)
+    }
   } catch {}
 }
 
@@ -646,6 +729,41 @@ export function apply(ctx) {
         }
         workspace = resolved
       }
+      if (body.agent === 'antigravity') {
+        let conv
+        try {
+          const data = await daemonCall('POST', '/conversations', { cwd: workspace })
+          conv = data.conversation
+        } catch (err) {
+          sendError(res, 502, 'daemon_unavailable', String(err?.message || err))
+          return
+        }
+        const t = {
+          id: crypto.randomUUID(),
+          agent: 'antigravity',
+          sessionId: conv.id,
+          workspace,
+          preset: null,
+          title: null,
+          state: 'active',
+          createdAt: new Date().toISOString(),
+          lastActivityAt: new Date().toISOString(),
+          lastTurn: null,
+          events: [],
+          seq: 0,
+          waitSeq: 0,
+          eventSeq: 0,
+          waiting: false,
+          turnText: '',
+        }
+        threads.set(t.id, t)
+        threadsBySession.set(t.sessionId, t.id)
+        pushThreadEvent(t, 'thread.state', { state: 'active', sessionId: t.sessionId, agent: 'antigravity' })
+        saveThreads()
+        console.log(`[muse-agent-link] agy thread ${t.id} -> conversation ${t.sessionId}`)
+        sendJson(res, 201, { ok: true, thread: threadView(t) })
+        return
+      }
       let sessionId
       try {
         const value = await gw('session', 'create', {
@@ -704,6 +822,7 @@ export function apply(ctx) {
     }
 
     if (sub === '/thread' && req.method === 'GET') {
+      await refreshAgyPermissions()
       const t = threads.get(url.searchParams.get('id') || '')
       if (!t) {
         sendError(res, 404, 'thread_not_found', 'Thread not found.')
@@ -728,6 +847,28 @@ export function apply(ctx) {
       }
       if (!body.text || typeof body.text !== 'string') {
         sendError(res, 400, 'bad_request', 'text is required.')
+        return
+      }
+      if (t.agent === 'antigravity') {
+        t.state = 'running'
+        t.lastActivityAt = new Date().toISOString()
+        saveThreads()
+        void (async () => {
+          try {
+            const data = await daemonCall('POST', `/conversations/${t.sessionId}/prompt`, { text: body.text })
+            const conv = data.conversation || {}
+            t.lastTurn = conv.lastTurn || { status: 'ok', finishedAt: new Date().toISOString(), resultText: '' }
+            if (conv.title) t.title = conv.title
+            pushThreadEvent(t, 'turn.finished', { status: t.lastTurn.status, resultText: t.lastTurn.resultText || '' })
+          } catch (err) {
+            t.lastTurn = { status: 'failed', finishedAt: new Date().toISOString(), resultText: '', error: String(err?.message || err) }
+            pushThreadEvent(t, 'turn.finished', { status: 'failed', error: t.lastTurn.error })
+          } finally {
+            if (t.state === 'running') t.state = 'active'
+            saveThreads()
+          }
+        })()
+        sendJson(res, 202, { ok: true, thread: threadView(t) })
         return
       }
       const mode = body.mode === 'steer' ? 'steer' : 'queue'
@@ -757,6 +898,16 @@ export function apply(ctx) {
       const t = threads.get(url.searchParams.get('id') || '')
       if (!t) {
         sendError(res, 404, 'thread_not_found', 'Thread not found.')
+        return
+      }
+      if (t.agent === 'antigravity') {
+        try {
+          await daemonCall('POST', `/conversations/${t.sessionId}/cancel`)
+        } catch (err) {
+          sendError(res, 502, 'daemon_unavailable', String(err?.message || err))
+          return
+        }
+        sendJson(res, 200, { ok: true, thread: threadView(t) })
         return
       }
       try {
@@ -793,6 +944,34 @@ export function apply(ctx) {
         return
       }
       const id = String(body.id || url.searchParams.get('id') || '')
+      const agyPerm = agyPermissions.get(id)
+      if (agyPerm) {
+        const kinds =
+          body.decision === 'approve_once'
+            ? ['allow_once', 'allow_always']
+            : ['reject_once', 'reject_always']
+        const option =
+          agyPerm.options.find((o) => kinds.includes(o.kind)) || agyPerm.options[0]
+        if (!option) {
+          sendError(res, 400, 'bad_request', 'No option available for this permission.')
+          return
+        }
+        try {
+          await daemonCall('POST', `/permissions/${id}`, { optionId: option.optionId })
+        } catch (err) {
+          sendError(res, 502, 'daemon_unavailable', String(err?.message || err))
+          return
+        }
+        agyPermissions.delete(id)
+        const t = threads.get(agyPerm.threadId)
+        if (t) {
+          pushThreadEvent(t, 'approval.resolved', { id, decision: body.decision, via: 'controller', agent: 'antigravity' })
+          if (t.state === 'awaiting_approval') t.state = 'running'
+          saveThreads()
+        }
+        sendJson(res, 200, { ok: true, id, decision: body.decision, optionId: option.optionId })
+        return
+      }
       const pending = pendingApprovals.get(id)
       if (!pending) {
         sendError(res, 410, 'approval_expired', 'Approval is no longer pending.')

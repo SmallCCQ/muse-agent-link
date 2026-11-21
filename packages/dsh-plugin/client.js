@@ -129,7 +129,9 @@ window.__ModuleLoader__.load({
           if (verEl) verEl.textContent = `v${data.version}`
           stateEl.textContent = data.paired
             ? `已配对 · ${data.machine}`
-            : '未配对 · 通道待接入'
+            : data.pairingCode
+              ? `未配对 · 配对码 ${data.pairingCode}`
+              : '未配对 · 通道待接入'
         } catch {
           stateEl.textContent = '状态接口未就绪'
         }

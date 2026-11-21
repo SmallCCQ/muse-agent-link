@@ -50,6 +50,26 @@
   注：PowerShell 的 ScheduledTask cmdlet 从 SSH 会话注册的交互任务不执行，
   必须用 schtasks.exe /IT——后续机器侧操作按此办理。
 
+## M1 通道打通（2026-11-22 01:20，插件 v0.2.1）
+
+- 传输：Victor 经 Tailscale 直连宿主 3080 端口的插件路由，未新开监听端口。
+- 配对：插件生成一次性配对码（30 分钟有效；状态接口只对本机回环请求披露，
+  供侧边栏卡片显示给机主）；`POST /pair` 校验后发每机独立设备令牌，
+  插件只存 SHA-256 哈希，令牌本体只在 Victor 侧（仓库外文件，600 权限）。
+  本机已配对成功（paired=true），卡片显示「已配对」。
+- 任务：`POST /tasks` 以 Job 台账落盘（`~/.dsh/muse-agent-link/jobs/`），
+  执行体为插件拉起的 `dsh headless` 一次性运行（默认工作区
+  `~/.dsh/muse-agent-link/workspace`，并发上限 2，超时可调）；
+  `GET /task?id=` 轮询取结果，`POST /task-cancel?id=` 取消，`POST /unpair` 解绑。
+- 实测：任务 1「Reply with exactly: LINK_OK」9 秒成功返回原文；
+  任务 2 在默认工作区建文件 link-test.txt，内容经 SSH 独立核对为 `M1_OK`。
+- 踩坑：宿主 webServer 的 `kind: 'prefix'` 路由对 API 子路径不匹配（宿主回 404），
+  v0.2.1 改为全部 exact 路由 + 查询参数传 job id。
+- Victor 侧客户端：`tools/link_client.py`（status/pair/task/job/jobs/unpair）。
+- 未做（下一层）：交互式会话绑定（线程↔UI Session、steer、审批转发）需要接入
+  宿主内部 Gateway，属 M1.5；Antigravity 属 M2。当前 headless 任务内的工具
+  权限遵循 headless profile 自身的 permission preset。
+
 ## 待确认风险
 
 - `~/.gemini/antigravity-cli/cli.log` 显示 **2026-11-12** 有多次

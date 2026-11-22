@@ -1,5 +1,5 @@
 // ==== muse-agent-link status pill (BEGIN) ====
-// Muse direct-link status card for the Antigravity desktop app (v2).
+// Muse direct-link status card for the Antigravity desktop app (v1.2).
 // Appended to antigravity-suite-client.js by append-pill.cjs; the suite
 // bootstrap evals that file in the app window, and this IIFE renders a
 // sidebar card styled and mounted like the suite's own Usage & Billing
@@ -117,6 +117,26 @@ border-top:1px solid var(--ag-ultra-border,rgba(127,127,127,.22));font-size:11.5
     return card
   }
 
+  // Mirror the Usage & Billing trigger card's *computed* style so this
+  // card always wears the exact same background/border/shadow the
+  // current skin paints on it (the skin overrides that card with
+  // sampled glass colors via !important rules keyed to its class, which
+  // a plain var() background cannot reproduce — it resolves to gray).
+  function mirrorRefStyle(el) {
+    const ref =
+      document.querySelector('.dsh-ub-trigger') ||
+      document.querySelector('.dsh-ultra-unified-card')
+    if (!ref || ref === el) return
+    const cs = window.getComputedStyle(ref)
+    el.style.backgroundColor = cs.backgroundColor
+    el.style.backgroundImage = cs.backgroundImage
+    el.style.borderColor = cs.borderColor
+    el.style.boxShadow = cs.boxShadow
+    el.style.color = cs.color
+    el.style.backdropFilter = cs.backdropFilter
+    el.style.webkitBackdropFilter = cs.backdropFilter
+  }
+
   function mount() {
     const el = ensureCard()
     const anchor = findAnchor()
@@ -133,6 +153,7 @@ border-top:1px solid var(--ag-ultra-border,rgba(127,127,127,.22));font-size:11.5
     if (el.parentElement !== anchor.container || el.nextSibling !== anchor.beforeNode) {
       anchor.container.insertBefore(el, anchor.beforeNode)
     }
+    mirrorRefStyle(el)
   }
 
   function stateText() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Victor-side client for the Muse Agent Link channel (office-workstation pilot).
+"""Victor-side client for the Muse Agent Link channel.
 
 Talks to the DSH plugin endpoint over Tailscale through the runtime proxy.
 Usage:
@@ -10,7 +10,8 @@ Usage:
   link_client.py jobs
   link_client.py unpair
 
-The device token is read from ../.device-token-office-workstation (never commit it).
+Machine selection: MUSE_LINK_MACHINE env var (default office-workstation).
+The device token is read from ../.device-token-<machine> (never commit it).
 """
 import base64
 import json
@@ -19,11 +20,19 @@ import socket
 import sys
 import urllib.parse
 
-HOST = "100.91.205.57"  # office-workstation tailnet IP
-PORT = 3080
+MACHINES = {
+    "office-workstation": "100.91.205.57",
+    "cnlt-pf23d7z3": "100.117.132.86",
+}
+MACHINE = os.environ.get("MUSE_LINK_MACHINE", "office-workstation")
+HOST = os.environ.get("MUSE_LINK_HOST", MACHINES[MACHINE])
+PORT = int(os.environ.get("MUSE_LINK_PORT", "3080"))
 BASE = "/api/muse-agent-link"
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOKEN_FILE = os.path.join(HERE, "..", ".device-token-office-workstation")
+TOKEN_FILE = os.environ.get(
+    "MUSE_LINK_TOKEN_FILE",
+    os.path.join(HERE, "..", f".device-token-{MACHINE}"),
+)
 
 
 def request(method, path, body=None, token=None):

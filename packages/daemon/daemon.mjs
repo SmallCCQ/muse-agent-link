@@ -52,7 +52,7 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 
-const VERSION = '0.2.1'
+const VERSION = '0.2.2'
 const PORT = 47615
 const HOST = '127.0.0.1'
 const STATE_DIR = path.join(os.homedir(), '.dsh', 'muse-agent-link')
@@ -321,6 +321,19 @@ function convView(c) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', 'http://localhost')
   const parts = url.pathname.split('/').filter(Boolean)
+  // CORS: the Antigravity app window (and only loopback pages like it)
+  // fetches /status for the link status card; without these headers the
+  // renderer blocks the response and the card falsely shows "offline".
+  // The daemon binds loopback only and protected routes still require
+  // the bearer token, so a wildcard origin does not weaken auth.
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204)
+    res.end()
+    return
+  }
   try {
     if (url.pathname === '/status' && req.method === 'GET') {
       const hub = hubInfo()

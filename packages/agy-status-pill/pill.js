@@ -1,66 +1,137 @@
 // ==== muse-agent-link status pill (BEGIN) ====
-// Muse direct-link status pill for the Antigravity desktop app.
-// Appended to antigravity-suite-client.js by append-pill.js; the suite
+// Muse direct-link status card for the Antigravity desktop app (v2).
+// Appended to antigravity-suite-client.js by append-pill.cjs; the suite
 // bootstrap evals that file in the app window, and this IIFE renders a
-// small pill in the bottom-left corner that polls the local muse-agent
-// -link daemon (http://127.0.0.1:47615/status, no auth needed) and shows
-// the link state: connected / app not ready / daemon offline.
+// sidebar card styled and mounted like the suite's own Usage & Billing
+// trigger card (.dsh-ub-trigger): it is inserted INTO the sidebar footer
+// container, directly above the Customizations/Settings rows, so it
+// stacks in flow and never overlays the settings button. Status comes
+// from the local muse-agent-link daemon (http://127.0.0.1:47615/status).
 (() => {
   if (window.__museLinkPill) return
 
   const DAEMON_STATUS = 'http://127.0.0.1:47615/status'
   const POLL_MS = 10000
+  const CARD_ID = 'muse-link-card'
 
   const css = `
-#muse-link-pill{position:fixed;left:14px;bottom:14px;z-index:2147483000;display:flex;align-items:center;gap:7px;
-padding:5px 12px 5px 10px;border-radius:999px;background:rgba(13,17,23,.85);border:1px solid rgba(255,255,255,.16);
-color:#e5e7eb;font:12px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif;cursor:pointer;user-select:none;
-backdrop-filter:blur(8px);box-shadow:0 4px 18px rgba(0,0,0,.35)}
-#muse-link-pill .mlp-dot{width:8px;height:8px;border-radius:50%;background:#9ca3af;flex:none}
-#muse-link-pill[data-mode="ok"] .mlp-dot{background:#34d399;box-shadow:0 0 6px #34d39988}
-#muse-link-pill[data-mode="warn"] .mlp-dot{background:#fbbf24;box-shadow:0 0 6px #fbbf2488}
-#muse-link-pill[data-mode="down"] .mlp-dot{background:#f87171;box-shadow:0 0 6px #f8717188}
-#muse-link-pill .mlp-name{font-weight:600;letter-spacing:.02em}
-#muse-link-pill .mlp-state{opacity:.85}
-#muse-link-card{position:fixed;left:14px;bottom:52px;z-index:2147483000;width:248px;padding:10px 12px;border-radius:12px;
-background:rgba(13,17,23,.92);border:1px solid rgba(255,255,255,.16);color:#e5e7eb;
-font:11.5px/1.65 -apple-system,"Segoe UI",system-ui,sans-serif;backdrop-filter:blur(10px);
-box-shadow:0 8px 28px rgba(0,0,0,.45);display:none}
-#muse-link-card.open{display:block}
-#muse-link-card .mlc-title{font-weight:600;font-size:12px;margin-bottom:4px}
-#muse-link-card .mlc-row{display:flex;justify-content:space-between;gap:10px}
+#muse-link-card{box-sizing:border-box;width:100%;min-width:0;margin:10px 0 4px;
+border:1px solid var(--ag-ultra-border,rgba(127,127,127,.28));border-radius:12px;
+background:var(--ag-ultra-sampled-bg,var(--ag-ultra-bg,rgba(30,34,40,.72)));
+-webkit-backdrop-filter:blur(14px) saturate(1.2);backdrop-filter:blur(14px) saturate(1.2);
+box-shadow:var(--ag-ultra-shadow,0 4px 18px rgba(0,0,0,.25));
+color:var(--ag-ultra-sampled-fg,var(--ag-ultra-fg,#e5e7eb));
+font:12px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif;
+padding:9px 12px;cursor:pointer;user-select:none;position:relative;overflow:hidden}
+#muse-link-card:hover{border-color:var(--ag-ultra-border-hover,rgba(96,165,250,.45))}
+#muse-link-card .mlc-head{display:flex;align-items:center;gap:8px}
+#muse-link-card .mlc-dot{width:8px;height:8px;border-radius:50%;background:#9ca3af;flex:none}
+#muse-link-card[data-mode="ok"] .mlc-dot{background:#34d399;box-shadow:0 0 6px #34d39988}
+#muse-link-card[data-mode="warn"] .mlc-dot{background:#fbbf24;box-shadow:0 0 6px #fbbf2488}
+#muse-link-card[data-mode="down"] .mlc-dot{background:#f87171;box-shadow:0 0 6px #f8717188}
+#muse-link-card .mlc-name{font-weight:600;letter-spacing:.02em;flex:none}
+#muse-link-card .mlc-state{margin-left:auto;opacity:.85;flex:none}
+#muse-link-card .mlc-details{display:none;margin-top:7px;padding-top:7px;
+border-top:1px solid var(--ag-ultra-border,rgba(127,127,127,.22));font-size:11.5px}
+#muse-link-card.open .mlc-details{display:block}
+#muse-link-card .mlc-row{display:flex;justify-content:space-between;gap:10px;line-height:1.65}
 #muse-link-card .mlc-k{opacity:.65;flex:none}
 #muse-link-card .mlc-v{text-align:right;word-break:break-all}
 `
 
   let mode = 'init'
   let data = null
-  let root = null
   let card = null
 
-  function ensureDom() {
-    if (!document.getElementById('muse-link-pill-style')) {
+  // Same anchoring strategy as the suite's sidebar widgets: find the
+  // sidebar footer rows (Settings/Customizations first, then Plugins/
+  // Skills/Automations) in the bottom-left and insert before them.
+  function findAnchor() {
+    const footerLabels = new Set(['Customizations', '自定义', 'Settings', '设置'])
+    const fallbackLabels = new Set(['Plugins', '插件', 'Automations', '自动化', 'Skills', '技能'])
+    const nodes = document.querySelectorAll('span, div, button, a, [role="button"], [role="menuitem"]')
+    const candidates = []
+    for (const el of nodes) {
+      if (el.children && el.children.length > 0) continue
+      if (el.closest && el.closest('#' + CARD_ID)) continue
+      const txt = (el.textContent || '').trim()
+      const isFooter = footerLabels.has(txt)
+      const isFallback = !isFooter && fallbackLabels.has(txt)
+      if (!isFooter && !isFallback) continue
+      const row = el.closest('button, a, [role="button"], [role="menuitem"]') || el.parentElement
+      if (!row) continue
+      const r = row.getBoundingClientRect()
+      if (r.left >= 0 && r.left < 80 && r.width >= 40 && r.width <= 380 && r.top > window.innerHeight * 0.5) {
+        candidates.push({ row, top: r.top, priority: isFooter ? 0 : 1 })
+      }
+    }
+    if (candidates.length === 0) return null
+    candidates.sort((a, b) => (a.priority !== b.priority ? a.priority - b.priority : a.top - b.top))
+    let wrap = candidates[0].row
+    while (
+      wrap.parentElement &&
+      wrap.parentElement !== document.body &&
+      wrap.parentElement.children.length === 1 &&
+      wrap.parentElement.getBoundingClientRect().height < 90
+    ) {
+      wrap = wrap.parentElement
+    }
+    const p = wrap.parentElement
+    if (!p || p === document.body) return null
+    const pr = p.getBoundingClientRect()
+    if (pr.width < 150 || pr.width > 400) return null
+    let before = wrap
+    for (const ch of Array.from(p.children)) {
+      if (ch.id === CARD_ID) continue
+      const cr = ch.getBoundingClientRect()
+      if (cr.top > window.innerHeight * 0.5 && cr.height > 16 && cr.height < 90) {
+        before = ch
+        break
+      }
+    }
+    return { container: p, beforeNode: before }
+  }
+
+  function ensureCard() {
+    if (!document.getElementById('muse-link-card-style')) {
       const st = document.createElement('style')
-      st.id = 'muse-link-pill-style'
+      st.id = 'muse-link-card-style'
       st.textContent = css
       document.head.appendChild(st)
     }
-    if (!root || !document.contains(root)) {
-      root = document.createElement('div')
-      root.id = 'muse-link-pill'
-      root.setAttribute('data-mode', 'init')
-      root.title = 'Muse 直连状态（点击查看详情）'
-      root.innerHTML =
-        '<span class="mlp-dot"></span><span class="mlp-name">Muse 直连</span><span class="mlp-state">检测中…</span>'
-      root.addEventListener('click', () => {
-        if (card) card.classList.toggle('open')
-      })
-      document.body.appendChild(root)
-    }
-    if (!card || !document.contains(card)) {
+    if (!card) {
       card = document.createElement('div')
-      card.id = 'muse-link-card'
-      document.body.appendChild(card)
+      card.id = CARD_ID
+      card.className = 'notranslate'
+      card.setAttribute('translate', 'no')
+      card.setAttribute('data-ag-localization-skip', 'true')
+      card.setAttribute('data-mode', 'init')
+      card.title = 'Muse 直连状态（点击展开详情）'
+      card.innerHTML =
+        '<div class="mlc-head"><span class="mlc-dot"></span>' +
+        '<span class="mlc-name">Muse 直连</span>' +
+        '<span class="mlc-state">检测中…</span></div>' +
+        '<div class="mlc-details"></div>'
+      card.addEventListener('click', () => card.classList.toggle('open'))
+    }
+    return card
+  }
+
+  function mount() {
+    const el = ensureCard()
+    const anchor = findAnchor()
+    if (!anchor) {
+      el.style.display = 'none'
+      return
+    }
+    const cr = anchor.container.getBoundingClientRect()
+    if (cr.width < 140) {
+      el.style.display = 'none'
+      return
+    }
+    el.style.display = 'block'
+    if (el.parentElement !== anchor.container || el.nextSibling !== anchor.beforeNode) {
+      anchor.container.insertBefore(el, anchor.beforeNode)
     }
   }
 
@@ -72,23 +143,25 @@ box-shadow:0 8px 28px rgba(0,0,0,.45);display:none}
   }
 
   function render() {
-    ensureDom()
-    root.setAttribute('data-mode', mode)
-    root.querySelector('.mlp-state').textContent = stateText()
+    const el = ensureCard()
+    el.setAttribute('data-mode', mode)
+    el.querySelector('.mlc-state').textContent = stateText()
     const rows = []
     const row = (k, v) =>
       rows.push(
         `<div class="mlc-row"><span class="mlc-k">${k}</span><span class="mlc-v">${v ?? '—'}</span></div>`
       )
-    row('状态', stateText())
     if (data) {
       row('机器', data.machine)
       row('守护进程', data.version ? 'v' + data.version : null)
       row('语言服务', data.lsVersion)
       row('直连会话', data.conversations)
       row('检查时间', new Date().toLocaleTimeString())
+    } else {
+      row('检查时间', new Date().toLocaleTimeString())
     }
-    card.innerHTML = `<div class="mlc-title">Muse 直连 · Antigravity</div>` + rows.join('')
+    el.querySelector('.mlc-details').innerHTML = rows.join('')
+    mount()
   }
 
   async function poll() {
@@ -110,14 +183,11 @@ box-shadow:0 8px 28px rgba(0,0,0,.45);display:none}
     render()
   }
 
-  ensureDom()
   render()
   poll()
   setInterval(poll, POLL_MS)
-  // The app is a SPA and may wipe foreign DOM nodes; re-attach if needed.
-  setInterval(() => {
-    if (!root || !document.contains(root)) render()
-  }, 5000)
+  // The app re-renders its sidebar often; keep the card mounted in flow.
+  setInterval(mount, 3000)
 
   window.__museLinkPill = { refresh: poll }
 })()

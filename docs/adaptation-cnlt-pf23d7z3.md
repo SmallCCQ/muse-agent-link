@@ -64,18 +64,34 @@ thread → desktop conversation 5153c1ac-2c20-4360-894b-5b3b63f9c03c →
   `~/.dsh/muse-agent-link/run-daemon.cmd`) and was started once
   manually; it listens on 127.0.0.1:47615 as designed.
 
-## Dynamic host port (known limitation)
+## Dynamic host port — solved by the plugin's fixed-port mirror (v0.6.0)
 
 - Unlike the web profile's fixed 3080, the desktop host binds dynamic
   ports. At pairing time it listened on the tailnet address at
   **63289** (plus loopback 63290/63291 for internal services).
-  `tools/link_client.py` therefore takes `MUSE_LINK_PORT` (and
-  `MUSE_LINK_MACHINE` / `MUSE_LINK_HOST` / `MUSE_LINK_TOKEN_FILE`).
-- If the channel stops answering after a DSH restart, the port has
-  likely changed: read the current one on the machine with
-  `Get-NetTCPConnection -State Listen` for the host process and update
-  `MUSE_LINK_PORT`. A self-discovery mechanism (plugin records its
-  port somewhere Victor can reach) is future work.
+- Plugin v0.6.0 removes the problem: following the lan-access bundle's
+  pattern, the plugin runs an extra http server on the machine's
+  Tailscale address at the FIXED port **47616** that forwards into the
+  host's own web server (`ctx.webServer.server`). Only the
+  `/api/muse-agent-link` prefix is forwarded (everything else 404s),
+  and the plugin's token auth still gates every route. The host's
+  dynamic port is read from `ctx.webServer.port` at load, so restarts
+  no longer matter. `tools/link_client.py` defaults cnlt-pf23d7z3 to
+  47616 (`MUSE_LINK_MACHINE` / `MUSE_LINK_PORT` / `MUSE_LINK_HOST` /
+  `MUSE_LINK_TOKEN_FILE` still override).
+- Verified 2026-11-22 after a full app restart onto an unknown new
+  dynamic port: status via 47616 reported v0.6.0 / paired, and a fresh
+  DSH thread round-trip returned the expected marker.
+- The v0.6.0 update itself was delivered THROUGH the channel: a
+  dispatched DSH thread on this machine downloaded index.js (40587
+  bytes) and package.json (771 bytes) from this repo's raw URLs,
+  verified sizes and version strings, backed up the old files as
+  `*.bak-muse-20261122-060`, and replaced them. One caveat: the
+  detached restart script killed the app as designed, but its
+  Start-Process relaunch did not take (Cai started the app manually).
+  File replacement via dispatched sessions works; unattended app
+  relaunch does not — plan a human click for future host restarts
+  that must be forced.
 
 ## Installers
 

@@ -25,8 +25,13 @@ MACHINES = {
     "cnlt-pf23d7z3": "100.117.132.86",
 }
 MACHINE = os.environ.get("MUSE_LINK_MACHINE", "office-workstation")
+# Default channel ports per machine. office-workstation's web host is
+# fixed at 3080; cnlt-pf23d7z3's desktop host is dynamic, so the plugin
+# (v0.6.0+) mirrors its API on the fixed port 47616 on the tailnet
+# address. MUSE_LINK_PORT overrides either.
+MACHINE_PORTS = {"office-workstation": 3080, "cnlt-pf23d7z3": 47616}
 HOST = os.environ.get("MUSE_LINK_HOST", MACHINES[MACHINE])
-PORT = int(os.environ.get("MUSE_LINK_PORT", "3080"))
+PORT = int(os.environ.get("MUSE_LINK_PORT", str(MACHINE_PORTS.get(MACHINE, 3080))))
 BASE = "/api/muse-agent-link"
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOKEN_FILE = os.environ.get(

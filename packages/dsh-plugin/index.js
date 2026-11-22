@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import { createServer } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -10,7 +11,7 @@ export const name = 'muse-agent-link'
 // injecting it: this Cordis host throws on un-injected property access.
 export const inject = ['webServer', 'connection', 'typertGateway']
 
-export const VERSION = '0.5.0'
+export const VERSION = '0.6.0'
 
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 const STATE_DIR = path.join(DSH_HOME, 'muse-agent-link')
@@ -19,6 +20,8 @@ const JOBS_DIR = path.join(STATE_DIR, 'jobs')
 const THREADS_PATH = path.join(STATE_DIR, 'threads.json')
 const DEBUG_DIR = path.join(STATE_DIR, 'threads-debug')
 const DEFAULT_WORKSPACE = path.join(STATE_DIR, 'workspace')
+
+const MIRROR_PORT = 47616
 
 const MAX_CONCURRENT_JOBS = 2
 const DEFAULT_TIMEOUT_SEC = 600
@@ -86,6 +89,71 @@ function extractText(node, depth = 0) {
 }
 
 // ---------- pairing state ----------
+
+// ---------- fixed-port tailnet mirror ----------
+// The desktop host binds a dynamic port, so the channel needs a stable
+// entry point. Following the lan-access bundle's pattern, the plugin runs
+// an extra http server on the machine's Tailscale address at a FIXED port
+// (MIRROR_PORT) that forwards into the host's own web server
+// (ctx.webServer.server). Only this plugin's API prefix is forwarded;
+// anything else gets a 404. The plugin's token auth still gates every
+// route, exactly as on the host's own listener.
+
+function tailscaleIpv4() {
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const info of list ?? []) {
+      if (info.family !== 'IPv4' || info.internal) continue
+      const parts = info.address.split('.').map(Number)
+      if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return info.address
+    }
+  }
+  return null
+}
+
+function loadBrowserSecret(connection) {
+  if (connection?.browserAuth?.secret instanceof Buffer) {
+    return connection.browserAuth.secret
+  }
+  try {
+    const raw = fs.readFileSync(path.join(DSH_HOME, '.credentials.yaml'), 'utf8')
+    const m = raw.match(/secret:\s*([A-Za-z0-9_-]+)/)
+    if (m) return Buffer.from(m[1], 'base64url')
+  } catch {}
+  return null
+}
+
+// Same cookie the lan-access bundle mints so the host's connection layer
+// accepts requests arriving through a non-loopback authority.
+function ensureMirrorCookie(req, res, secret) {
+  if (!secret) return
+  const host = req.headers.host
+  if (!host) return
+  let authority
+  try {
+    authority = new URL(`http://${host}`).host
+  } catch {
+    return
+  }
+  const cookieName =
+    'dsh-auth-' + crypto.createHash('sha256').update(authority).digest('base64url')
+  const existing = req.headers.cookie || ''
+  if (existing.includes(`${cookieName}=`)) return
+  const issuedAt = Date.now() - 5000
+  const expiresAt = issuedAt + 29 * 86400 * 1000
+  const payload = { version: 1, authority, issuedAt, expiresAt }
+  const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+  const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url')
+  const pair = `${cookieName}=v1.${body}.${sig}`
+  req.headers.cookie = existing ? `${existing}; ${pair}` : pair
+  if (res && typeof res.setHeader === 'function') {
+    try {
+      res.setHeader(
+        'Set-Cookie',
+        `${pair}; Max-Age=${29 * 86400}; Path=/; Expires=${new Date(expiresAt).toUTCString()}; HttpOnly; SameSite=Strict`
+      )
+    } catch {}
+  }
+}
 
 function loadState() {
   try {
@@ -1089,7 +1157,71 @@ export function apply(ctx) {
     registerSafe({ kind: 'exact', path: p, handler: dispatch })
   }
 
+  // ----- fixed-port tailnet mirror -----
+  const mirrorServers = new Set()
+  let mirrorTimer = null
+  try {
+    const ws = ctx.webServer
+    if (ws?.server && ws?.port) {
+      const secret = loadBrowserSecret(ctx.connection)
+      const bindMirror = () => {
+        const ip = tailscaleIpv4()
+        if (!ip) return false
+        for (const s of mirrorServers) if (s.__ip === ip) return true
+        try {
+          const th = ctx.connection?.trustedHosts
+          if (Array.isArray(th) && !th.includes(ip)) th.push(ip)
+        } catch {}
+        const srv = createServer((req, res) => {
+          const p = (req.url || '').split('?')[0]
+          if (!p.startsWith('/api/muse-agent-link')) {
+            res.writeHead(404, { 'content-type': 'application/json' })
+            res.end('{"error":"not_found"}')
+            return
+          }
+          ensureMirrorCookie(req, res, secret)
+          ws.server.emit('request', req, res)
+        })
+        srv.__ip = ip
+        srv.on('error', (err) => {
+          console.warn('[muse-agent-link] mirror listen failed:', err?.message || err)
+          mirrorServers.delete(srv)
+        })
+        srv.listen(MIRROR_PORT, ip, () => {
+          console.log(
+            `[muse-agent-link] tailnet mirror http://${ip}:${MIRROR_PORT} -> host port ${ws.port}`
+          )
+        })
+        mirrorServers.add(srv)
+        return true
+      }
+      if (!bindMirror()) {
+        // Tailscale may come up after the host; retry for ~10 minutes.
+        let tries = 0
+        mirrorTimer = setInterval(() => {
+          if (bindMirror() || ++tries >= 40) {
+            clearInterval(mirrorTimer)
+            mirrorTimer = null
+          }
+        }, 15000)
+        mirrorTimer.unref?.()
+      }
+    }
+  } catch (err) {
+    console.warn('[muse-agent-link] mirror setup failed:', err?.message || err)
+  }
+
   ctx.on('dispose', () => {
+    if (mirrorTimer) {
+      clearInterval(mirrorTimer)
+      mirrorTimer = null
+    }
+    for (const s of mirrorServers) {
+      try {
+        s.close()
+      } catch {}
+    }
+    mirrorServers.clear()
     for (const d of routeDisposers) {
       try {
         if (typeof d === 'function') d()

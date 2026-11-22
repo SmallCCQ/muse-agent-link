@@ -1,0 +1,1 @@
+{"author":{"name":"Victor (Muse)"},"description":"在 Antigravity 桌面应用左下角显示 Muse 直连状态胶囊（已连接 / 应用未就绪 / 守护进程离线），数据来自本机 muse-agent-link 守护进程 http://127.0.0.1:47615/status。","displayName":"Antigravity Muse 直连状态","logo":"./assets/logo.svg","name":"antigravity-muse-link","title":"Antigravity Muse 直连状态","version":"1.0.0"}

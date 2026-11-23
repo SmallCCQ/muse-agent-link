@@ -1,3 +1,11 @@
+// Muse Agent Link v2 — Thin DSH Runtime Adapter (Cordis Plugin)
+// No longer binds Tailscale :47616! The standalone muse-hub.mjs owns :47616 so
+// Antigravity Desktop and DSH are completely fault-isolated.
+// This plugin:
+//   1. Runs a loopback-only RPC server (127.0.0.1:<ephemeral>) authenticated via hub-internal-token.txt.
+//   2. Registers with Muse Hub (127.0.0.1:47617) every 10s and hydrates bound DSH sessions.
+//   3. Streams DSH session/event & competitive approval/request to Muse Hub.
+//   4. Proxies exact local admin routes (/api/muse-agent-link/admin-*) for client.js.
 import { spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -6,38 +14,34 @@ import os from 'node:os'
 import path from 'node:path'
 
 export const name = 'muse-agent-link'
-// Same injection set dsh-im uses for host session control, plus webServer
-// for this plugin's own channel routes. Never probe ctx.<service> without
-// injecting it: this Cordis host throws on un-injected property access.
 export const inject = ['webServer', 'connection', 'typertGateway']
-
-export const VERSION = '0.6.0'
+export const VERSION = '2.0.0'
 
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 const STATE_DIR = path.join(DSH_HOME, 'muse-agent-link')
-const STATE_PATH = path.join(STATE_DIR, 'state.json')
-const JOBS_DIR = path.join(STATE_DIR, 'jobs')
-const THREADS_PATH = path.join(STATE_DIR, 'threads.json')
-const DEBUG_DIR = path.join(STATE_DIR, 'threads-debug')
-const DEFAULT_WORKSPACE = path.join(STATE_DIR, 'workspace')
+const INTERNAL_TOKEN_PATH = path.join(STATE_DIR, 'hub-internal-token.txt')
+const HUB_ADMIN_URL = process.env.MUSE_HUB_ADMIN_URL || 'http://127.0.0.1:47617'
 
-const MIRROR_PORT = 47616
-
-const MAX_CONCURRENT_JOBS = 2
-const DEFAULT_TIMEOUT_SEC = 600
-const PAIRING_TTL_MS = 30 * 60 * 1000
-const RESULT_TAIL_CHARS = 4000
 const APPROVAL_TTL_MS = 10 * 60 * 1000
-const THREAD_EVENT_CAP = 500
-const WAIT_SLICE_MS = 120000
+const WAIT_SLICE_MS = 120_000
+const RESULT_TAIL_CHARS = 12_000
+const PROGRESS_THROTTLE_MS = 2500
 
-// ---------- small utils ----------
+function readInternalToken() {
+  try {
+    return fs.readFileSync(INTERNAL_TOKEN_PATH, 'utf8').trim()
+  } catch {
+    return ''
+  }
+}
 
-function sha256Hex(text) {
-  return crypto.createHash('sha256').update(text).digest('hex')
+function tokenEquals(given, expected) {
+  if (!given || !expected || given.length !== expected.length) return false
+  return crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected))
 }
 
 function sendJson(res, code, obj) {
+  if (res.writableEnded) return
   res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' })
   res.end(JSON.stringify(obj))
 }
@@ -51,7 +55,7 @@ async function readJsonBody(req) {
   let size = 0
   for await (const chunk of req) {
     size += chunk.length
-    if (size > 1024 * 1024) throw new Error('body too large')
+    if (size > 2 * 1024 * 1024) throw new Error('body too large')
     chunks.push(chunk)
   }
   if (!chunks.length) return {}
@@ -63,7 +67,6 @@ function isLoopback(req) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
 }
 
-// Unwrap a Typert RemoteResult defensively: { value } | { ok, value } | raw.
 function unwrap(result) {
   if (result && typeof result === 'object') {
     if ('error' in result && result.error) {
@@ -74,7 +77,6 @@ function unwrap(result) {
   return result
 }
 
-// Extract assistant text from history records / events of varying shapes.
 function extractText(node, depth = 0) {
   if (!node || depth > 5) return ''
   if (typeof node === 'string') return ''
@@ -88,411 +90,123 @@ function extractText(node, depth = 0) {
   return out
 }
 
-// ---------- pairing state ----------
-
-// ---------- fixed-port tailnet mirror ----------
-// The desktop host binds a dynamic port, so the channel needs a stable
-// entry point. Following the lan-access bundle's pattern, the plugin runs
-// an extra http server on the machine's Tailscale address at a FIXED port
-// (MIRROR_PORT) that forwards into the host's own web server
-// (ctx.webServer.server). Only this plugin's API prefix is forwarded;
-// anything else gets a 404. The plugin's token auth still gates every
-// route, exactly as on the host's own listener.
-
-function tailscaleIpv4() {
-  for (const list of Object.values(os.networkInterfaces())) {
-    for (const info of list ?? []) {
-      if (info.family !== 'IPv4' || info.internal) continue
-      const parts = info.address.split('.').map(Number)
-      if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return info.address
-    }
+function mimeFromExt(filePath) {
+  const ext = path.extname(String(filePath || '')).toLowerCase()
+  const map = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+    '.svg': 'image/svg+xml',
+    '.pdf': 'application/pdf',
+    '.md': 'text/markdown; charset=utf-8',
+    '.txt': 'text/plain; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.csv': 'text/csv; charset=utf-8',
+    '.html': 'text/html; charset=utf-8',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    '.zip': 'application/zip',
   }
-  return null
+  return map[ext] || 'application/octet-stream'
 }
 
-function loadBrowserSecret(connection) {
-  if (connection?.browserAuth?.secret instanceof Buffer) {
-    return connection.browserAuth.secret
-  }
-  try {
-    const raw = fs.readFileSync(path.join(DSH_HOME, '.credentials.yaml'), 'utf8')
-    const m = raw.match(/secret:\s*([A-Za-z0-9_-]+)/)
-    if (m) return Buffer.from(m[1], 'base64url')
-  } catch {}
-  return null
-}
+const ARTIFACT_EXTS = new Set([
+  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg',
+  '.pdf', '.html', '.md', '.txt', '.csv', '.json',
+  '.xlsx', '.docx', '.pptx', '.zip',
+])
+const SKIP_DIRS = new Set(['node_modules', '.git', '.venv', '__pycache__', 'dist', '.cache'])
 
-// Same cookie the lan-access bundle mints so the host's connection layer
-// accepts requests arriving through a non-loopback authority.
-function ensureMirrorCookie(req, res, secret) {
-  if (!secret) return
-  const host = req.headers.host
-  if (!host) return
-  let authority
-  try {
-    authority = new URL(`http://${host}`).host
-  } catch {
-    return
-  }
-  const cookieName =
-    'dsh-auth-' + crypto.createHash('sha256').update(authority).digest('base64url')
-  const existing = req.headers.cookie || ''
-  if (existing.includes(`${cookieName}=`)) return
-  const issuedAt = Date.now() - 5000
-  const expiresAt = issuedAt + 29 * 86400 * 1000
-  const payload = { version: 1, authority, issuedAt, expiresAt }
-  const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
-  const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url')
-  const pair = `${cookieName}=v1.${body}.${sig}`
-  req.headers.cookie = existing ? `${existing}; ${pair}` : pair
-  if (res && typeof res.setHeader === 'function') {
+function collectTurnArtifacts(cwd, resultText, sinceMs) {
+  const found = new Map() // realPath -> { path, name, mime, mtimeMs }
+  const maxBytes = 10 * 1024 * 1024
+  const cutoff = (sinceMs || Date.now()) - 1500
+
+  function tryAdd(filePath) {
     try {
-      res.setHeader(
-        'Set-Cookie',
-        `${pair}; Max-Age=${29 * 86400}; Path=/; Expires=${new Date(expiresAt).toUTCString()}; HttpOnly; SameSite=Strict`
-      )
-    } catch {}
-  }
-}
-
-function loadState() {
-  try {
-    return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'))
-  } catch {
-    return null
-  }
-}
-
-function saveState(state) {
-  try {
-    fs.mkdirSync(STATE_DIR, { recursive: true })
-    fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2))
-  } catch {}
-}
-
-function newPairingCode() {
-  return String(crypto.randomInt(0, 1000000)).padStart(6, '0')
-}
-
-function ensureState() {
-  let state = loadState()
-  if (!state) {
-    state = {
-      plugin: 'muse-agent-link',
-      version: VERSION,
-      machine: os.hostname(),
-      paired: false,
-      tokenHash: null,
-      pairingCode: null,
-      pairingExpiresAt: null,
-      createdAt: new Date().toISOString(),
-    }
-  }
-  state.version = VERSION
-  state.machine = os.hostname()
-  if (!state.paired) {
-    const expired =
-      !state.pairingCode ||
-      !state.pairingExpiresAt ||
-      Date.now() > new Date(state.pairingExpiresAt).getTime()
-    if (expired) {
-      state.pairingCode = newPairingCode()
-      state.pairingExpiresAt = new Date(Date.now() + PAIRING_TTL_MS).toISOString()
-    }
-  }
-  saveState(state)
-  return state
-}
-
-function tokenMatches(state, token) {
-  if (!state?.tokenHash || !token) return false
-  const a = Buffer.from(sha256Hex(token), 'hex')
-  const b = Buffer.from(state.tokenHash, 'hex')
-  return a.length === b.length && crypto.timingSafeEqual(a, b)
-}
-
-// ---------- headless jobs (fallback channel) ----------
-
-const runningJobs = new Map()
-
-function jobPath(id) {
-  return path.join(JOBS_DIR, `${id}.json`)
-}
-
-function saveJob(job) {
-  try {
-    fs.mkdirSync(JOBS_DIR, { recursive: true })
-    fs.writeFileSync(jobPath(job.id), JSON.stringify(job, null, 2))
-  } catch {}
-}
-
-function loadJob(id) {
-  if (!/^[0-9a-f-]{36}$/i.test(id)) return null
-  try {
-    return JSON.parse(fs.readFileSync(jobPath(id), 'utf8'))
-  } catch {
-    return null
-  }
-}
-
-function listJobs(limit = 20) {
-  try {
-    return fs
-      .readdirSync(JOBS_DIR)
-      .filter((f) => f.endsWith('.json'))
-      .map((f) => {
-        try {
-          return JSON.parse(fs.readFileSync(path.join(JOBS_DIR, f), 'utf8'))
-        } catch {
-          return null
-        }
-      })
-      .filter(Boolean)
-      .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
-      .slice(0, limit)
-      .map((j) => ({
-        id: j.id,
-        state: j.state,
-        workspace: j.workspace,
-        promptPreview: String(j.prompt || '').slice(0, 120),
-        createdAt: j.createdAt,
-        finishedAt: j.finishedAt || null,
-        exitCode: j.exitCode ?? null,
-      }))
-  } catch {
-    return []
-  }
-}
-
-function resolveDshEntry() {
-  const argv1 = process.argv[1] || ''
-  if (argv1 && argv1.replace(/\\/g, '/').includes('@deepseek-ai/dsh/')) return argv1
-  return path.join(
-    os.homedir(),
-    'AppData',
-    'Roaming',
-    'npm',
-    'node_modules',
-    '@deepseek-ai',
-    'dsh',
-    'lib',
-    'bin.js'
-  )
-}
-
-function runJob(job) {
-  const entry = resolveDshEntry()
-  const child = spawn(process.execPath, [entry, 'headless', job.prompt], {
-    cwd: job.workspace,
-    env: { ...process.env, DSH_HOME },
-    windowsHide: true,
-  })
-  runningJobs.set(job.id, child)
-  let stdout = ''
-  let stderr = ''
-  const timer = setTimeout(() => {
-    try {
-      child.kill()
-    } catch {}
-  }, job.timeoutSec * 1000)
-  child.stdout.on('data', (d) => {
-    stdout += d.toString()
-  })
-  child.stderr.on('data', (d) => {
-    stderr += d.toString()
-  })
-  child.on('error', (err) => {
-    clearTimeout(timer)
-    runningJobs.delete(job.id)
-    job.state = 'failed'
-    job.error = String(err?.message || err)
-    job.finishedAt = new Date().toISOString()
-    saveJob(job)
-  })
-  child.on('close', (code) => {
-    clearTimeout(timer)
-    runningJobs.delete(job.id)
-    job.exitCode = code
-    job.finishedAt = new Date().toISOString()
-    job.state = code === 0 ? 'succeeded' : 'failed'
-    job.result = stdout.slice(-RESULT_TAIL_CHARS)
-    if (code !== 0) job.stderrTail = stderr.slice(-2000)
-    saveJob(job)
-    console.log(`[muse-agent-link] job ${job.id} ${job.state} (exit ${code})`)
-  })
-}
-
-// ---------- interactive threads (real host sessions via Typert gateway) ----------
-
-const threads = new Map()
-const threadsBySession = new Map()
-const pendingApprovals = new Map()
-
-function loadThreads() {
-  try {
-    const arr = JSON.parse(fs.readFileSync(THREADS_PATH, 'utf8'))
-    for (const t of arr) {
-      threads.set(t.id, { ...t, events: [], seq: 0, waitSeq: 0, waiting: false })
-      threadsBySession.set(t.sessionId, t.id)
-    }
-  } catch {}
-}
-
-function saveThreads() {
-  try {
-    fs.mkdirSync(STATE_DIR, { recursive: true })
-    const arr = [...threads.values()].map((t) => ({
-      id: t.id,
-      agent: t.agent || 'dsh',
-      sessionId: t.sessionId,
-      desktopConversationId: t.desktopConversationId || null,
-      workspace: t.workspace,
-      preset: t.preset || null,
-      title: t.title || null,
-      state: t.state,
-      createdAt: t.createdAt,
-      lastActivityAt: t.lastActivityAt,
-      lastTurn: t.lastTurn || null,
-    }))
-    fs.writeFileSync(THREADS_PATH, JSON.stringify(arr, null, 2))
-  } catch {}
-}
-
-function threadView(t) {
-  return {
-    id: t.id,
-    agent: t.agent || 'dsh',
-    sessionId: t.sessionId,
-    desktopConversationId: t.desktopConversationId || null,
-    workspace: t.workspace,
-    preset: t.preset || null,
-    title: t.title || null,
-    state: t.state,
-    createdAt: t.createdAt,
-    lastActivityAt: t.lastActivityAt,
-    lastTurn: t.lastTurn || null,
-    pendingApprovals: [
-      ...[...pendingApprovals.values()]
-        .filter((p) => p.threadId === t.id)
-        .map((p) => ({
-          id: p.id,
-          toolName: p.toolName,
-          reason: p.reason || null,
-          workspace: t.workspace,
-          risk: p.risk || 'normal',
-          expiresAt: p.expiresAt,
-        })),
-      ...[...agyPermissions.entries()]
-        .filter(([, p]) => p.threadId === t.id)
-        .map(([id, p]) => ({
-          id,
-          toolName: p.toolName,
-          reason: null,
-          workspace: t.workspace,
-          risk: 'normal',
-          expiresAt: null,
-          agent: 'antigravity',
-        })),
-    ],
-  }
-}
-
-function pushThreadEvent(t, type, payload) {
-  t.seq += 1
-  t.events.push({ seq: t.seq, type, at: new Date().toISOString(), payload })
-  if (t.events.length > THREAD_EVENT_CAP) {
-    t.events.splice(0, t.events.length - THREAD_EVENT_CAP)
-  }
-  t.lastActivityAt = new Date().toISOString()
-}
-
-function debugCapture(sessionId, event) {
-  try {
-    fs.mkdirSync(DEBUG_DIR, { recursive: true })
-    const file = path.join(DEBUG_DIR, `${sessionId}.jsonl`)
-    const line = JSON.stringify(event) + '\n'
-    const size = fs.existsSync(file) ? fs.statSync(file).size : 0
-    if (size < 512 * 1024) fs.appendFileSync(file, line)
-  } catch {}
-}
-
-
-// ---------- Antigravity daemon client (loopback, same machine) ----------
-
-const DAEMON_PORT = 47615
-const DAEMON_TOKEN_PATH = path.join(STATE_DIR, 'daemon-token.txt')
-
-function daemonToken() {
-  try {
-    return fs.readFileSync(DAEMON_TOKEN_PATH, 'utf8').trim()
-  } catch {
-    return null
-  }
-}
-
-async function daemonCall(method, pathname, body) {
-  const token = daemonToken()
-  if (!token) throw new Error('daemon token not found (daemon not started yet)')
-  const payload = body === undefined ? null : JSON.stringify(body)
-  const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}${pathname}`, {
-    method,
-    headers: {
-      authorization: `Bearer ${token}`,
-      ...(payload ? { 'content-type': 'application/json' } : {}),
-    },
-    body: payload,
-    signal: AbortSignal.timeout(30 * 60 * 1000),
-  })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error(data?.error?.message || `daemon HTTP ${res.status}`)
-  return data
-}
-
-// Pending Antigravity permission requests, mirrored from the daemon:
-// permId -> { threadId, options, toolName }
-const agyPermissions = new Map()
-
-async function refreshAgyPermissions() {
-  try {
-    const data = await daemonCall('GET', '/permissions')
-    const seen = new Set()
-    for (const perm of data.permissions || []) {
-      seen.add(perm.id)
-      const threadId = threadsBySession.get(perm.sessionId)
-      if (!threadId) continue
-      if (!agyPermissions.has(perm.id)) {
-        agyPermissions.set(perm.id, {
-          threadId,
-          options: perm.options || [],
-          toolName: perm.toolCall?.title || perm.toolCall?.kind || 'tool',
+      const resolved = path.resolve(filePath)
+      if (!fs.existsSync(resolved)) return
+      const st = fs.statSync(resolved)
+      if (!st.isFile() || st.size <= 0 || st.size > maxBytes) return
+      if (st.mtimeMs < cutoff) return
+      const ext = path.extname(resolved).toLowerCase()
+      if (!ARTIFACT_EXTS.has(ext)) return
+      const real = fs.realpathSync(resolved)
+      if (!found.has(real)) {
+        found.set(real, {
+          path: real,
+          name: path.basename(real),
+          mime: mimeFromExt(real),
+          mtimeMs: st.mtimeMs,
         })
-        const t = threads.get(threadId)
-        if (t) {
-          t.state = 'awaiting_approval'
-          pushThreadEvent(t, 'approval.requested', {
-            id: perm.id,
-            toolName: agyPermissions.get(perm.id).toolName,
-            reason: null,
-            agent: 'antigravity',
-          })
+      }
+    } catch {}
+  }
+
+  // 1. Scan workspace up to depth 2 for files modified/created during this turn
+  if (cwd && fs.existsSync(cwd)) {
+    let scanned = 0
+    function walk(dir, depth) {
+      if (depth > 2 || scanned > 200) return
+      let entries = []
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
+      for (const e of entries) {
+        if (scanned > 200) break
+        scanned += 1
+        const full = path.join(dir, e.name)
+        if (e.isDirectory()) {
+          if (!SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) walk(full, depth + 1)
+        } else if (e.isFile()) {
+          tryAdd(full)
         }
       }
     }
-    for (const id of [...agyPermissions.keys()]) {
-      if (!seen.has(id)) agyPermissions.delete(id)
-    }
-  } catch {}
+    walk(cwd, 0)
+  }
+
+  // 2. Extract explicit file:/// or Windows absolute paths mentioned in reply text
+  const text = String(resultText || '')
+  const fileUriRe = /file:\/\/\/([A-Za-z]:\/[^\s)"'`<>#?]+)/g
+  let m
+  while ((m = fileUriRe.exec(text)) !== null) {
+    tryAdd(decodeURIComponent(m[1]))
+  }
+  const winPathRe = /([A-Za-z]:\\[^\s"'`<>|*?]+?\.(?:png|jpg|jpeg|webp|gif|svg|pdf|html|md|txt|csv|json|xlsx|docx|pptx|zip))/gi
+  while ((m = winPathRe.exec(text)) !== null) {
+    tryAdd(m[1])
+  }
+
+  return [...found.values()]
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, 10)
+    .map(({ mtimeMs, ...rest }) => rest)
 }
 
-// ---------- plugin ----------
+function scanLocalDshSessions(limit = 25) {
+  const sessionsDir = path.join(DSH_HOME, 'sessions')
+  const items = []
+  try {
+    for (const entry of fs.readdirSync(sessionsDir, { withFileTypes: true })) {
+      const full = path.join(sessionsDir, entry.name)
+      const st = fs.statSync(full)
+      const sessionId = entry.isFile() ? entry.name.replace(/\.json$/i, '') : entry.name
+      if (!sessionId || sessionId.startsWith('.')) continue
+      items.push({
+        agent: 'dsh',
+        localSessionId: sessionId,
+        updatedAt: new Date(st.mtimeMs).toISOString(),
+        mtimeMs: st.mtimeMs,
+      })
+    }
+  } catch {}
+  items.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return items.slice(0, limit).map(({ mtimeMs, ...rest }) => rest)
+}
 
 export function apply(ctx) {
-  let state = ensureState()
-  try {
-    fs.mkdirSync(DEFAULT_WORKSPACE, { recursive: true })
-  } catch {}
-  loadThreads()
-
   let peer = null
   function getPeer() {
     if (!peer) {
@@ -506,64 +220,119 @@ export function apply(ctx) {
     return unwrap(result)
   }
 
-  console.log(`[muse-agent-link] v${VERSION} loaded on ${state.machine} (paired=${state.paired})`)
+  // sessionId -> { threadId, ownerAccountId, approvalPolicy, waiting, waitSeq, turnText, lastProgressAt, currentTurnId }
+  const boundSessions = new Map()
+  // approvalId -> { id, sessionId, threadId, settle, via }
+  const pendingApprovals = new Map()
 
-  // ----- turn completion via session/wait -----
+  async function hubPost(pathname, body) {
+    const tok = readInternalToken()
+    if (!tok) return null
+    try {
+      const res = await fetch(`${HUB_ADMIN_URL}${pathname}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-hub-internal-token': tok,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10_000),
+      })
+      return await res.json().catch(() => null)
+    } catch {
+      return null
+    }
+  }
 
-  async function waitForTurn(t) {
-    if (t.waiting) return
-    t.waiting = true
+  function pushHubEvent(entry, type, payload = {}) {
+    void hubPost('/internal/events', {
+      type,
+      sessionId: entry.sessionId,
+      threadId: entry.threadId,
+      payload,
+    })
+  }
+
+  function upsertBoundSession({ threadId, sessionId, ownerAccountId, approvalPolicy, cwd }) {
+    if (!sessionId) return null
+    const existing = boundSessions.get(sessionId)
+    if (existing) {
+      if (threadId) existing.threadId = threadId
+      if (ownerAccountId) existing.ownerAccountId = ownerAccountId
+      if (approvalPolicy) existing.approvalPolicy = approvalPolicy
+      if (cwd) existing.cwd = cwd
+      return existing
+    }
+    const entry = {
+      sessionId,
+      threadId: threadId || null,
+      ownerAccountId: ownerAccountId || null,
+      approvalPolicy: approvalPolicy || 'remote_or_local',
+      cwd: cwd || path.join(STATE_DIR, 'workspace'),
+      waiting: false,
+      waitSeq: 0,
+      turnText: '',
+      turnStartedAt: Date.now(),
+      lastProgressAt: 0,
+      currentTurnId: null,
+    }
+    boundSessions.set(sessionId, entry)
+    return entry
+  }
+
+  async function waitForTurn(entry, turnId) {
+    if (entry.waiting) return
+    entry.waiting = true
+    entry.turnStartedAt = Date.now()
+    entry.currentTurnId = turnId || entry.currentTurnId
     try {
       for (;;) {
         const value = await gw('session', 'wait', {
           request: {
-            sessionId: t.sessionId,
+            sessionId: entry.sessionId,
             timeoutMs: WAIT_SLICE_MS,
-            ...(t.waitSeq ? { afterSeq: t.waitSeq } : {}),
+            ...(entry.waitSeq ? { afterSeq: entry.waitSeq } : {}),
             maxMessages: 20,
           },
         })
         const records = value?.output?.records ?? []
         for (const r of records) {
-          if (Number.isSafeInteger(r?.seq) && r.seq > t.waitSeq) t.waitSeq = r.seq
+          if (Number.isSafeInteger(r?.seq) && r.seq > entry.waitSeq) entry.waitSeq = r.seq
         }
         if (value?.reason === 'timeout') {
-          if (t.state !== 'running' && t.state !== 'awaiting_approval') break
           continue
         }
         const waitText = records.map((r) => extractText(r)).filter(Boolean).join('\n').trim()
-        const text = waitText || (t.turnText || '').trim()
+        const text = (waitText || entry.turnText || '').trim().slice(-RESULT_TAIL_CHARS)
         if (value?.reason === 'idle') {
-          t.state = 'active'
-          t.lastTurn = {
+          const artifacts = collectTurnArtifacts(entry.cwd, text, entry.turnStartedAt)
+          pushHubEvent(entry, 'turn.finished', {
+            turnId: entry.currentTurnId,
             status: 'ok',
-            finishedAt: new Date().toISOString(),
-            resultText: (text || t.lastTurn?.resultText || '').slice(-RESULT_TAIL_CHARS),
-          }
-          pushThreadEvent(t, 'turn.finished', { status: 'ok', resultText: t.lastTurn.resultText })
+            resultText: text,
+            ...(artifacts.length > 0 ? { artifacts } : {}),
+          })
         } else if (value?.reason === 'input-required') {
-          t.state = 'awaiting_input'
-          if (text) {
-            t.lastTurn = {
-              status: 'input-required',
-              finishedAt: new Date().toISOString(),
-              resultText: text.slice(-RESULT_TAIL_CHARS),
-            }
-          }
-          pushThreadEvent(t, 'turn.input_required', { resultText: text.slice(-RESULT_TAIL_CHARS) })
+          pushHubEvent(entry, 'turn.input_required', {
+            turnId: entry.currentTurnId,
+            resultText: text,
+          })
         }
-        saveThreads()
         break
       }
     } catch (err) {
-      console.warn(`[muse-agent-link] wait failed for ${t.sessionId}:`, err?.message || err)
-      if (t.state === 'running') t.state = 'active'
+      pushHubEvent(entry, 'turn.finished', {
+        turnId: entry.currentTurnId,
+        status: 'failed',
+        resultText: '',
+        error: String(err?.message || err),
+      })
     } finally {
-      t.waiting = false
+      entry.waiting = false
     }
   }
 
-  // ----- host event observation (state + approvals bookkeeping) -----
+  // ---------- Host event subscription ----------
 
   if (typeof ctx.on === 'function') {
     try {
@@ -572,29 +341,37 @@ export function apply(ctx) {
         (session, event) => {
           const sessionId = session?.id ?? session?.sessionId
           if (typeof sessionId !== 'string' || !event) return
-          const threadId = threadsBySession.get(sessionId)
-          if (!threadId) return
-          const t = threads.get(threadId)
-          if (!t) return
-          debugCapture(sessionId, event)
-          if (Number.isSafeInteger(event.seq) && event.seq > (t.eventSeq || 0)) t.eventSeq = event.seq
+          const entry = boundSessions.get(sessionId)
+          if (!entry) return
+
           if (event.type === 'turn/start') {
-            if (t.state !== 'awaiting_approval') t.state = 'running'
-            t.turnText = ''
-            pushThreadEvent(t, 'turn.started', { turn: event.data?.turn ?? null })
+            entry.turnText = ''
+            pushHubEvent(entry, 'turn.started', {
+              turnId: entry.currentTurnId,
+              source: entry.waiting ? 'muse' : 'local_ui',
+            })
+            // If user started a turn locally inside DSH desktop UI, also wait for completion!
+            if (!entry.waiting) {
+              void waitForTurn(entry, `local_${Date.now().toString(36)}`)
+            }
+          } else if (event.type === 'user/message') {
+            const text = extractText(event.data?.message ?? event.data)
+            if (text && text.trim()) {
+              pushHubEvent(entry, 'user.message', { text })
+            }
           } else if (event.type === 'assistant/message') {
             const text = extractText(event.data?.message ?? event.data)
             if (text) {
-              t.turnText = (t.turnText || '') + text
-              pushThreadEvent(t, 'output.delta', { text })
+              entry.turnText = (entry.turnText || '') + text
+              const now = Date.now()
+              if (now - entry.lastProgressAt >= PROGRESS_THROTTLE_MS) {
+                entry.lastProgressAt = now
+                pushHubEvent(entry, 'output.progress', {
+                  turnId: entry.currentTurnId,
+                  deltaTail: entry.turnText.slice(-300),
+                })
+              }
             }
-          } else if (event.type === 'approval/asked') {
-            pushThreadEvent(t, 'approval.asked', {
-              id: event.data?.id ?? null,
-              callId: event.data?.callId ?? null,
-            })
-          } else if (event.type === 'approval/decided') {
-            pushThreadEvent(t, 'approval.decided', { id: event.data?.id ?? null })
           }
         },
         { global: true }
@@ -603,18 +380,15 @@ export function apply(ctx) {
       console.warn('[muse-agent-link] session/event subscription failed:', err?.message || err)
     }
 
-    // Competitive approvals for our own threads only; every other session
-    // passes straight through to the native providers.
+    // Competitive approval hook gated by account approvalPolicy
     try {
       ctx.on(
         'approval/request',
         (request, next) => {
           const session = request?.agent?.session
           const sessionId = session?.id ?? request?.agent?.id
-          const threadId = typeof sessionId === 'string' ? threadsBySession.get(sessionId) : undefined
-          if (!threadId) return next()
-          const t = threads.get(threadId)
-          if (!t) return next()
+          const entry = typeof sessionId === 'string' ? boundSessions.get(sessionId) : undefined
+          if (!entry) return next()
 
           let events = []
           try {
@@ -637,42 +411,59 @@ export function apply(ctx) {
           }
           if (!approvalId) return next()
 
+          const expiresAt = new Date(Date.now() + APPROVAL_TTL_MS).toISOString()
+
+          // Collaborator or local_only policy: notify Hub for visibility, NEVER allow remote approve
+          if (entry.approvalPolicy === 'local_only') {
+            pushHubEvent(entry, 'approval.requested', {
+              id: approvalId,
+              toolName: request.toolName ?? 'tool',
+              reason: request.reason ?? null,
+              expiresAt,
+              canRemoteApprove: false,
+            })
+            return Promise.resolve()
+              .then(() => next())
+              .then((outcome) => {
+                pushHubEvent(entry, 'approval.resolved', {
+                  id: approvalId,
+                  decision: outcome,
+                  via: 'local-ui',
+                })
+                return outcome
+              })
+          }
+
+          // Owner competitive race: first decision (remote Muse OR local DSH UI) wins
           return new Promise((resolve) => {
             const pending = {
               id: approvalId,
-              threadId,
-              toolName: request.toolName ?? null,
-              reason: request.reason ?? null,
-              risk: 'normal',
-              expiresAt: new Date(Date.now() + APPROVAL_TTL_MS).toISOString(),
+              sessionId,
+              threadId: entry.threadId,
+              via: null,
               settle: (outcome) => {
                 if (!pendingApprovals.delete(approvalId)) return
                 clearTimeout(timer)
-                pushThreadEvent(t, 'approval.resolved', {
+                pushHubEvent(entry, 'approval.resolved', {
                   id: approvalId,
                   decision: outcome,
                   via: pending.via || 'controller',
                 })
-                if (t.state === 'awaiting_approval') t.state = 'running'
-                saveThreads()
                 resolve(outcome)
               },
-              via: null,
             }
             const timer = setTimeout(() => {
               pending.via = 'expired'
               pending.settle('rejected')
             }, APPROVAL_TTL_MS)
             pendingApprovals.set(approvalId, pending)
-            t.state = 'awaiting_approval'
-            pushThreadEvent(t, 'approval.requested', {
+            pushHubEvent(entry, 'approval.requested', {
               id: approvalId,
-              toolName: pending.toolName,
-              reason: pending.reason,
-              expiresAt: pending.expiresAt,
+              toolName: request.toolName ?? 'tool',
+              reason: request.reason ?? null,
+              expiresAt,
+              canRemoteApprove: true,
             })
-            saveThreads()
-            // Native UI races us; first decision wins (same rule as dsh-im).
             Promise.resolve()
               .then(() => next())
               .then(
@@ -695,7 +486,181 @@ export function apply(ctx) {
     }
   }
 
-  // ----- http routes -----
+  // ---------- Loopback RPC server for Muse Hub -> DSH ----------
+
+  let rpcBaseUrl = null
+  const rpcServer = createServer(async (req, res) => {
+    try {
+      const expected = readInternalToken()
+      const given = String(req.headers['x-hub-internal-token'] || '')
+      if (!tokenEquals(given, expected)) {
+        sendError(res, 401, 'unauthorized', 'Invalid internal token.')
+        return
+      }
+      const url = new URL(req.url || '/', 'http://127.0.0.1')
+      const body = req.method === 'POST' ? await readJsonBody(req) : {}
+
+      if (url.pathname === '/rpc/session/create' && req.method === 'POST') {
+        const value = await gw('session', 'create', {
+          request: {
+            cwd: String(body.cwd || path.join(STATE_DIR, 'workspace')),
+            ...(body.preset ? { agentPreset: String(body.preset) } : {}),
+          },
+        })
+        const sessionId = typeof value?.sessionId === 'string' ? value.sessionId : String(value?.sessionId ?? '')
+        if (!sessionId || sessionId === '[object Object]') {
+          sendError(res, 500, 'internal', 'DSH session create returned invalid sessionId')
+          return
+        }
+        let title = body.title || null
+        if (title) {
+          try {
+            const renamed = await gw('session', 'rename', { request: { sessionId, title: String(title) } })
+            if (renamed?.title) title = renamed.title
+          } catch {}
+        }
+        sendJson(res, 200, { ok: true, sessionId, title })
+        return
+      }
+
+      if (url.pathname === '/rpc/binding/sync' && req.method === 'POST') {
+        upsertBoundSession(body)
+        sendJson(res, 200, { ok: true })
+        return
+      }
+
+      if (url.pathname === '/rpc/session/prompt' && req.method === 'POST') {
+        const entry = upsertBoundSession(body)
+        const mode = body.mode === 'steer' ? 'steer' : 'queue'
+        await gw('session', 'prompt', {
+          request: {
+            requestId: crypto.randomUUID(),
+            sessionId: entry.sessionId,
+            mode,
+            content: [{ type: 'text', text: String(body.text || '') }],
+            clientTimeZone: 'Asia/Shanghai',
+          },
+        })
+        void waitForTurn(entry, body.turnId)
+        sendJson(res, 202, { ok: true })
+        return
+      }
+
+      if (url.pathname === '/rpc/session/cancel' && req.method === 'POST') {
+        await gw('session', 'cancel', { request: { sessionId: String(body.sessionId || '') } })
+        sendJson(res, 200, { ok: true })
+        return
+      }
+
+      if (url.pathname === '/rpc/session/list' && req.method === 'POST') {
+        let sessions = []
+        try {
+          const listed = await gw('session', 'list', { request: {} })
+          const rawList = listed?.sessions || listed?.items || (Array.isArray(listed) ? listed : [])
+          sessions = rawList.slice(0, Number(body.limit) || 25).map((s) => ({
+            agent: 'dsh',
+            localSessionId: s.sessionId || s.id,
+            title: s.title || null,
+            cwd: s.cwd || null,
+            updatedAt: s.updatedAt || s.lastActivityAt || null,
+          }))
+        } catch {
+          sessions = scanLocalDshSessions(Number(body.limit) || 25)
+        }
+        sendJson(res, 200, { ok: true, sessions })
+        return
+      }
+
+      if (url.pathname === '/rpc/approval/decide' && req.method === 'POST') {
+        const pending = pendingApprovals.get(String(body.id || ''))
+        if (!pending) {
+          sendError(res, 410, 'approval_expired', 'Approval is no longer pending.')
+          return
+        }
+        const outcome = body.decision === 'approve_once' ? 'allowed-once' : 'rejected'
+        pending.via = 'controller'
+        pending.settle(outcome)
+        sendJson(res, 200, { ok: true, decision: outcome })
+        return
+      }
+
+      sendError(res, 404, 'not_found', `Unknown RPC ${url.pathname}`)
+    } catch (err) {
+      sendError(res, 500, 'internal', String(err?.message || err))
+    }
+  })
+
+  let lastAutoLaunchMs = 0
+  function maybeAutoLaunchHub() {
+    const now = Date.now()
+    if (now - lastAutoLaunchMs < 30_000) return
+    lastAutoLaunchMs = now
+    const vbsPath = path.join(STATE_DIR, 'run-hub-hidden.vbs')
+    const hubPath = path.join(STATE_DIR, 'muse-hub.mjs')
+    try {
+      let child = null
+      if (process.platform === 'win32' && fs.existsSync(vbsPath)) {
+        child = spawn('wscript.exe', [vbsPath], { detached: true, stdio: 'ignore', windowsHide: true })
+      } else if (fs.existsSync(hubPath)) {
+        child = spawn(process.execPath, [hubPath], { detached: true, stdio: 'ignore', windowsHide: true })
+      }
+      child?.unref?.()
+    } catch {}
+  }
+
+  async function registerWithHub() {
+    if (!rpcBaseUrl) return
+    const resp = await hubPost('/internal/adapters/dsh/register', {
+      rpcBaseUrl,
+      version: VERSION,
+      pid: process.pid,
+    })
+    if (!resp) {
+      maybeAutoLaunchHub()
+      return
+    }
+    if (Array.isArray(resp.bindings)) {
+      for (const b of resp.bindings) {
+        upsertBoundSession(b)
+      }
+    }
+  }
+
+  let heartbeatTimer = null
+  rpcServer.listen(0, '127.0.0.1', () => {
+    const addr = rpcServer.address()
+    if (addr && typeof addr === 'object') {
+      rpcBaseUrl = `http://127.0.0.1:${addr.port}`
+      console.log(`[muse-agent-link] v${VERSION} thin DSH adapter listening on ${rpcBaseUrl}`)
+      void registerWithHub()
+      heartbeatTimer = setInterval(() => void registerWithHub(), 10_000)
+      heartbeatTimer.unref?.()
+    }
+  })
+
+  // ---------- Same-origin exact admin proxy routes for client.js ----------
+
+  async function proxyToHub(req, res, targetPath, methodOverride = null) {
+    if (!isLoopback(req)) {
+      sendError(res, 403, 'forbidden_source', 'Loopback UI only.')
+      return
+    }
+    try {
+      const method = methodOverride || req.method
+      const body = method === 'POST' || method === 'PATCH' ? await readJsonBody(req) : undefined
+      const upstream = await fetch(`${HUB_ADMIN_URL}${targetPath}`, {
+        method,
+        headers: body !== undefined ? { 'content-type': 'application/json' } : {},
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(10_000),
+      })
+      const text = await upstream.text()
+      res.writeHead(upstream.status, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(text)
+    } catch (err) {
+      sendError(res, 503, 'hub_offline', `Muse Hub offline (${err?.message || err})`)
+    }
+  }
 
   const routeDisposers = []
   const registerSafe = (spec) => {
@@ -706,529 +671,54 @@ export function apply(ctx) {
     }
   }
 
-  async function dispatch(req, res) {
-    const url = new URL(req.url || '/', 'http://localhost')
-    const sub = url.pathname.replace('/api/muse-agent-link', '')
-    state = loadState() || state
-
-    if (sub === '/status' && (req.method === 'GET' || req.method === 'HEAD')) {
-      const body = {
-        ok: true,
-        plugin: 'muse-agent-link',
-        version: VERSION,
-        machine: os.hostname(),
-        paired: Boolean(state.paired),
-        channel: 'tailscale-direct',
-        time: new Date().toISOString(),
+  registerSafe({
+    kind: 'exact',
+    path: '/api/muse-agent-link/status',
+    handler: (req, res) => proxyToHub(req, res, '/v2/status', 'GET'),
+  })
+  registerSafe({
+    kind: 'exact',
+    path: '/api/muse-agent-link/admin-overview',
+    handler: (req, res) => proxyToHub(req, res, '/admin/overview', 'GET'),
+  })
+  registerSafe({
+    kind: 'exact',
+    path: '/api/muse-agent-link/admin-ticket',
+    handler: async (req, res) => {
+      const url = new URL(req.url || '/', 'http://localhost')
+      if (req.method === 'DELETE') {
+        const id = url.searchParams.get('id') || ''
+        return proxyToHub(req, res, `/admin/pairing-tickets/${encodeURIComponent(id)}`, 'DELETE')
       }
-      if (!state.paired && isLoopback(req)) {
-        body.pairingCode = state.pairingCode
-        body.pairingExpiresAt = state.pairingExpiresAt
-      }
-      sendJson(res, 200, body)
-      return
-    }
-
-    if (sub === '/pair' && req.method === 'POST') {
-      if (state.paired) {
-        sendError(res, 409, 'already_paired', 'This machine is already paired. Unpair first.')
-        return
-      }
-      let body
-      try {
-        body = await readJsonBody(req)
-      } catch {
-        sendError(res, 400, 'bad_request', 'Invalid JSON body.')
-        return
-      }
-      const codeOk =
-        body.code &&
-        body.code === state.pairingCode &&
-        state.pairingExpiresAt &&
-        Date.now() <= new Date(state.pairingExpiresAt).getTime()
-      if (!codeOk) {
-        sendError(res, 401, 'pairing_code_invalid', 'Pairing code is wrong or expired.')
-        return
-      }
-      const token = crypto.randomBytes(32).toString('hex')
-      state.paired = true
-      state.tokenHash = sha256Hex(token)
-      state.pairingCode = null
-      state.pairingExpiresAt = null
-      state.pairedAt = new Date().toISOString()
-      saveState(state)
-      console.log('[muse-agent-link] paired with controller')
-      sendJson(res, 200, { ok: true, token, machine: os.hostname() })
-      return
-    }
-
-    const auth = String(req.headers['authorization'] || '')
-    const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
-    if (!tokenMatches(state, token)) {
-      sendError(res, 401, 'unauthorized', 'Missing or invalid device token.')
-      return
-    }
-
-    if (sub === '/unpair' && req.method === 'POST') {
-      state.paired = false
-      state.tokenHash = null
-      state.pairingCode = newPairingCode()
-      state.pairingExpiresAt = new Date(Date.now() + PAIRING_TTL_MS).toISOString()
-      saveState(state)
-      console.log('[muse-agent-link] unpaired; new pairing code issued')
-      sendJson(res, 200, { ok: true, paired: false })
-      return
-    }
-
-    // ----- threads -----
-
-    if (sub === '/threads' && req.method === 'POST') {
-      let body
-      try {
-        body = await readJsonBody(req)
-      } catch {
-        sendError(res, 400, 'bad_request', 'Invalid JSON body.')
-        return
-      }
-      let workspace = DEFAULT_WORKSPACE
-      if (body.workspace) {
-        const resolved = path.resolve(String(body.workspace))
-        if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
-          sendError(res, 400, 'workspace_not_found', `Workspace does not exist: ${resolved}`)
-          return
-        }
-        workspace = resolved
-      }
-      if (body.agent === 'antigravity') {
-        // The desktop conversation gets a recognisable title in the
-        // Antigravity app, same convention as DSH session renames.
-        const stamp = new Date()
-        const label =
-          (body.title ? String(body.title) : null) ||
-          `Muse 直连 · ${String(stamp.getMonth() + 1).padStart(2, '0')}-${String(stamp.getDate()).padStart(2, '0')} ${String(stamp.getHours()).padStart(2, '0')}:${String(stamp.getMinutes()).padStart(2, '0')}`
-        let conv
-        try {
-          const data = await daemonCall('POST', '/conversations', { cwd: workspace, title: label })
-          conv = data.conversation
-        } catch (err) {
-          sendError(res, 502, 'daemon_unavailable', String(err?.message || err))
-          return
-        }
-        const t = {
-          id: crypto.randomUUID(),
-          agent: 'antigravity',
-          sessionId: conv.id,
-          desktopConversationId: null,
-          workspace,
-          preset: null,
-          title: label,
-          state: 'active',
-          createdAt: new Date().toISOString(),
-          lastActivityAt: new Date().toISOString(),
-          lastTurn: null,
-          events: [],
-          seq: 0,
-          waitSeq: 0,
-          eventSeq: 0,
-          waiting: false,
-          turnText: '',
-        }
-        threads.set(t.id, t)
-        threadsBySession.set(t.sessionId, t.id)
-        pushThreadEvent(t, 'thread.state', { state: 'active', sessionId: t.sessionId, agent: 'antigravity' })
-        saveThreads()
-        console.log(`[muse-agent-link] agy thread ${t.id} -> conversation ${t.sessionId}`)
-        sendJson(res, 201, { ok: true, thread: threadView(t) })
-        return
-      }
-      let sessionId
-      try {
-        const value = await gw('session', 'create', {
-          request: {
-            cwd: workspace,
-            ...(body.preset ? { agentPreset: String(body.preset) } : {}),
-          },
-        })
-        sessionId = typeof value?.sessionId === 'string' ? value.sessionId : String(value?.sessionId ?? '')
-        if (!sessionId || sessionId === '[object Object]') {
-          throw new Error(`create returned unusable value: ${JSON.stringify(value)?.slice(0, 200)}`)
-        }
-      } catch (err) {
-        sendError(res, 500, 'session_create_failed', String(err?.message || err))
-        return
-      }
-      const t = {
-        id: crypto.randomUUID(),
-        sessionId,
-        workspace,
-        preset: body.preset ? String(body.preset) : null,
-        title: body.title ? String(body.title) : null,
-        state: 'active',
-        createdAt: new Date().toISOString(),
-        lastActivityAt: new Date().toISOString(),
-        lastTurn: null,
-        events: [],
-        seq: 0,
-        waitSeq: 0,
-        eventSeq: 0,
-        waiting: false,
-      }
-      threads.set(t.id, t)
-      threadsBySession.set(t.sessionId, t.id)
-      // Give the session a recognisable title in the DSH UI (rename pins it).
-      const stamp = new Date()
-      const label =
-        t.title ||
-        `Muse 直连 · ${String(stamp.getMonth() + 1).padStart(2, '0')}-${String(stamp.getDate()).padStart(2, '0')} ${String(stamp.getHours()).padStart(2, '0')}:${String(stamp.getMinutes()).padStart(2, '0')}`
-      try {
-        const renamed = await gw('session', 'rename', { request: { sessionId, title: label } })
-        if (renamed?.title) t.title = renamed.title
-      } catch (err) {
-        console.warn('[muse-agent-link] rename failed:', err?.message || err)
-      }
-      pushThreadEvent(t, 'thread.state', { state: 'active', sessionId: t.sessionId })
-      saveThreads()
-      console.log(`[muse-agent-link] thread ${t.id} -> session ${t.sessionId}`)
-      sendJson(res, 201, { ok: true, thread: threadView(t) })
-      return
-    }
-
-    if (sub === '/threads' && req.method === 'GET') {
-      sendJson(res, 200, { ok: true, threads: [...threads.values()].map(threadView) })
-      return
-    }
-
-    if (sub === '/thread' && req.method === 'GET') {
-      await refreshAgyPermissions()
-      const t = threads.get(url.searchParams.get('id') || '')
-      if (!t) {
-        sendError(res, 404, 'thread_not_found', 'Thread not found.')
-        return
-      }
-      sendJson(res, 200, { ok: true, thread: threadView(t) })
-      return
-    }
-
-    if (sub === '/thread-message' && req.method === 'POST') {
-      let body
-      try {
-        body = await readJsonBody(req)
-      } catch {
-        sendError(res, 400, 'bad_request', 'Invalid JSON body.')
-        return
-      }
-      const t = threads.get(String(body.threadId || url.searchParams.get('id') || ''))
-      if (!t) {
-        sendError(res, 404, 'thread_not_found', 'Thread not found.')
-        return
-      }
-      if (!body.text || typeof body.text !== 'string') {
-        sendError(res, 400, 'bad_request', 'text is required.')
-        return
-      }
-      if (t.agent === 'antigravity') {
-        t.state = 'running'
-        t.lastActivityAt = new Date().toISOString()
-        saveThreads()
-        void (async () => {
-          try {
-            const data = await daemonCall('POST', `/conversations/${t.sessionId}/prompt`, { text: body.text })
-            const conv = data.conversation || {}
-            t.lastTurn = conv.lastTurn || { status: 'ok', finishedAt: new Date().toISOString(), resultText: '' }
-            if (conv.desktopConversationId) t.desktopConversationId = conv.desktopConversationId
-            if (conv.title) t.title = conv.title
-            pushThreadEvent(t, 'turn.finished', { status: t.lastTurn.status, resultText: t.lastTurn.resultText || '' })
-          } catch (err) {
-            t.lastTurn = { status: 'failed', finishedAt: new Date().toISOString(), resultText: '', error: String(err?.message || err) }
-            pushThreadEvent(t, 'turn.finished', { status: 'failed', error: t.lastTurn.error })
-          } finally {
-            if (t.state === 'running') t.state = 'active'
-            saveThreads()
-          }
-        })()
-        sendJson(res, 202, { ok: true, thread: threadView(t) })
-        return
-      }
-      const mode = body.mode === 'steer' ? 'steer' : 'queue'
-      try {
-        await gw('session', 'prompt', {
-          request: {
-            requestId: crypto.randomUUID(),
-            sessionId: t.sessionId,
-            mode,
-            content: [{ type: 'text', text: body.text }],
-            clientTimeZone: 'Asia/Shanghai',
-          },
-        })
-      } catch (err) {
-        sendError(res, 502, 'prompt_failed', String(err?.message || err))
-        return
-      }
-      t.state = 'running'
-      t.lastActivityAt = new Date().toISOString()
-      saveThreads()
-      void waitForTurn(t)
-      sendJson(res, 202, { ok: true, thread: threadView(t) })
-      return
-    }
-
-    if (sub === '/thread-stop' && req.method === 'POST') {
-      const t = threads.get(url.searchParams.get('id') || '')
-      if (!t) {
-        sendError(res, 404, 'thread_not_found', 'Thread not found.')
-        return
-      }
-      if (t.agent === 'antigravity') {
-        try {
-          await daemonCall('POST', `/conversations/${t.sessionId}/cancel`)
-        } catch (err) {
-          sendError(res, 502, 'daemon_unavailable', String(err?.message || err))
-          return
-        }
-        sendJson(res, 200, { ok: true, thread: threadView(t) })
-        return
-      }
-      try {
-        await gw('session', 'cancel', { request: { sessionId: t.sessionId } })
-      } catch (err) {
-        sendError(res, 502, 'cancel_failed', String(err?.message || err))
-        return
-      }
-      sendJson(res, 200, { ok: true, thread: threadView(t) })
-      return
-    }
-
-    if (sub === '/thread-events' && req.method === 'GET') {
-      const t = threads.get(url.searchParams.get('id') || '')
-      if (!t) {
-        sendError(res, 404, 'thread_not_found', 'Thread not found.')
-        return
-      }
-      const cursor = Number(url.searchParams.get('cursor') || 0)
-      sendJson(res, 200, {
-        ok: true,
-        cursor: t.seq,
-        events: t.events.filter((e) => e.seq > cursor),
-      })
-      return
-    }
-
-    if (sub === '/approvals' && req.method === 'POST') {
-      let body
-      try {
-        body = await readJsonBody(req)
-      } catch {
-        sendError(res, 400, 'bad_request', 'Invalid JSON body.')
-        return
-      }
-      const id = String(body.id || url.searchParams.get('id') || '')
-      const agyPerm = agyPermissions.get(id)
-      if (agyPerm) {
-        const kinds =
-          body.decision === 'approve_once'
-            ? ['allow_once', 'allow_always']
-            : ['reject_once', 'reject_always']
-        const option =
-          agyPerm.options.find((o) => kinds.includes(o.kind)) || agyPerm.options[0]
-        if (!option) {
-          sendError(res, 400, 'bad_request', 'No option available for this permission.')
-          return
-        }
-        try {
-          await daemonCall('POST', `/permissions/${id}`, { optionId: option.optionId })
-        } catch (err) {
-          sendError(res, 502, 'daemon_unavailable', String(err?.message || err))
-          return
-        }
-        agyPermissions.delete(id)
-        const t = threads.get(agyPerm.threadId)
-        if (t) {
-          pushThreadEvent(t, 'approval.resolved', { id, decision: body.decision, via: 'controller', agent: 'antigravity' })
-          if (t.state === 'awaiting_approval') t.state = 'running'
-          saveThreads()
-        }
-        sendJson(res, 200, { ok: true, id, decision: body.decision, optionId: option.optionId })
-        return
-      }
-      const pending = pendingApprovals.get(id)
-      if (!pending) {
-        sendError(res, 410, 'approval_expired', 'Approval is no longer pending.')
-        return
-      }
-      const outcome = body.decision === 'approve_once' ? 'allowed-once' : 'rejected'
-      pending.via = 'controller'
-      pending.settle(outcome)
-      sendJson(res, 200, { ok: true, id, decision: outcome })
-      return
-    }
-
-    // ----- headless jobs (fallback) -----
-
-    if (sub === '/tasks' && req.method === 'POST') {
-      if (runningJobs.size >= MAX_CONCURRENT_JOBS) {
-        sendError(res, 429, 'concurrency_limit', 'Too many running jobs.')
-        return
-      }
-      let body
-      try {
-        body = await readJsonBody(req)
-      } catch {
-        sendError(res, 400, 'bad_request', 'Invalid JSON body.')
-        return
-      }
-      if (!body.prompt || typeof body.prompt !== 'string') {
-        sendError(res, 400, 'bad_request', 'prompt is required.')
-        return
-      }
-      let workspace = DEFAULT_WORKSPACE
-      if (body.workspace) {
-        const resolved = path.resolve(String(body.workspace))
-        if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
-          sendError(res, 400, 'workspace_not_found', `Workspace does not exist: ${resolved}`)
-          return
-        }
-        workspace = resolved
-      }
-      const job = {
-        id: crypto.randomUUID(),
-        prompt: body.prompt,
-        workspace,
-        timeoutSec: Math.min(Math.max(Number(body.timeoutSec) || DEFAULT_TIMEOUT_SEC, 10), 3600),
-        state: 'running',
-        createdAt: new Date().toISOString(),
-        startedAt: new Date().toISOString(),
-        finishedAt: null,
-        exitCode: null,
-        result: null,
-      }
-      saveJob(job)
-      runJob(job)
-      console.log(`[muse-agent-link] job ${job.id} started in ${workspace}`)
-      sendJson(res, 202, { ok: true, job: { id: job.id, state: job.state, workspace } })
-      return
-    }
-
-    if (sub === '/tasks' && req.method === 'GET') {
-      sendJson(res, 200, { ok: true, jobs: listJobs() })
-      return
-    }
-
-    if (sub === '/task' && req.method === 'GET') {
-      const job = loadJob(url.searchParams.get('id') || '')
-      if (!job) {
-        sendError(res, 404, 'job_not_found', 'Job not found.')
-        return
-      }
-      sendJson(res, 200, { ok: true, job })
-      return
-    }
-
-    if (sub === '/task-cancel' && req.method === 'POST') {
-      const cancelId = url.searchParams.get('id') || ''
-      const child = runningJobs.get(cancelId)
-      if (!child) {
-        sendError(res, 404, 'job_not_running', 'Job is not running.')
-        return
-      }
-      try {
-        child.kill()
-      } catch {}
-      sendJson(res, 200, { ok: true, cancelling: cancelId })
-      return
-    }
-
-    sendError(res, 404, 'not_found', `No route for ${req.method} ${sub}`)
-  }
-
-  for (const p of [
-    '/api/muse-agent-link/status',
-    '/api/muse-agent-link/pair',
-    '/api/muse-agent-link/unpair',
-    '/api/muse-agent-link/tasks',
-    '/api/muse-agent-link/task',
-    '/api/muse-agent-link/task-cancel',
-    '/api/muse-agent-link/threads',
-    '/api/muse-agent-link/thread',
-    '/api/muse-agent-link/thread-message',
-    '/api/muse-agent-link/thread-stop',
-    '/api/muse-agent-link/thread-events',
-    '/api/muse-agent-link/approvals',
-  ]) {
-    registerSafe({ kind: 'exact', path: p, handler: dispatch })
-  }
-
-  // ----- fixed-port tailnet mirror -----
-  const mirrorServers = new Set()
-  let mirrorTimer = null
-  try {
-    const ws = ctx.webServer
-    if (ws?.server && ws?.port) {
-      const secret = loadBrowserSecret(ctx.connection)
-      const bindMirror = () => {
-        const ip = tailscaleIpv4()
-        if (!ip) return false
-        for (const s of mirrorServers) if (s.__ip === ip) return true
-        try {
-          const th = ctx.connection?.trustedHosts
-          if (Array.isArray(th) && !th.includes(ip)) th.push(ip)
-        } catch {}
-        const srv = createServer((req, res) => {
-          const p = (req.url || '').split('?')[0]
-          if (!p.startsWith('/api/muse-agent-link')) {
-            res.writeHead(404, { 'content-type': 'application/json' })
-            res.end('{"error":"not_found"}')
-            return
-          }
-          ensureMirrorCookie(req, res, secret)
-          ws.server.emit('request', req, res)
-        })
-        srv.__ip = ip
-        srv.on('error', (err) => {
-          console.warn('[muse-agent-link] mirror listen failed:', err?.message || err)
-          mirrorServers.delete(srv)
-        })
-        srv.listen(MIRROR_PORT, ip, () => {
-          console.log(
-            `[muse-agent-link] tailnet mirror http://${ip}:${MIRROR_PORT} -> host port ${ws.port}`
-          )
-        })
-        mirrorServers.add(srv)
-        return true
-      }
-      if (!bindMirror()) {
-        // Tailscale may come up after the host; retry for ~10 minutes.
-        let tries = 0
-        mirrorTimer = setInterval(() => {
-          if (bindMirror() || ++tries >= 40) {
-            clearInterval(mirrorTimer)
-            mirrorTimer = null
-          }
-        }, 15000)
-        mirrorTimer.unref?.()
-      }
-    }
-  } catch (err) {
-    console.warn('[muse-agent-link] mirror setup failed:', err?.message || err)
-  }
+      return proxyToHub(req, res, '/admin/pairing-tickets', 'POST')
+    },
+  })
+  registerSafe({
+    kind: 'exact',
+    path: '/api/muse-agent-link/admin-revoke',
+    handler: async (req, res) => {
+      const url = new URL(req.url || '/', 'http://localhost')
+      const id = url.searchParams.get('id') || ''
+      return proxyToHub(req, res, `/admin/accounts/${encodeURIComponent(id)}/revoke`, 'POST')
+    },
+  })
+  registerSafe({
+    kind: 'exact',
+    path: '/api/muse-agent-link/admin-local-sessions',
+    handler: (req, res) => proxyToHub(req, res, '/admin/local-sessions', 'GET'),
+  })
+  registerSafe({
+    kind: 'exact',
+    path: '/api/muse-agent-link/admin-attach',
+    handler: (req, res) => proxyToHub(req, res, '/admin/attach', 'POST'),
+  })
 
   ctx.on('dispose', () => {
-    if (mirrorTimer) {
-      clearInterval(mirrorTimer)
-      mirrorTimer = null
-    }
-    for (const s of mirrorServers) {
-      try {
-        s.close()
-      } catch {}
-    }
-    mirrorServers.clear()
+    if (heartbeatTimer) clearInterval(heartbeatTimer)
+    try { rpcServer.close() } catch {}
     for (const d of routeDisposers) {
-      try {
-        if (typeof d === 'function') d()
-      } catch {}
+      try { if (typeof d === 'function') d() } catch {}
     }
-    try {
-      peer?.dispose?.()
-    } catch {}
+    try { peer?.dispose?.() } catch {}
   })
 }

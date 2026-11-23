@@ -1,16 +1,13 @@
 // ==== muse-agent-link status pill (BEGIN) ====
-// Muse direct-link status card for the Antigravity desktop app (v1.2).
-// Appended to antigravity-suite-client.js by append-pill.cjs; the suite
-// bootstrap evals that file in the app window, and this IIFE renders a
-// sidebar card styled and mounted like the suite's own Usage & Billing
-// trigger card (.dsh-ub-trigger): it is inserted INTO the sidebar footer
-// container, directly above the Customizations/Settings rows, so it
-// stacks in flow and never overlays the settings button. Status comes
-// from the local muse-agent-link daemon (http://127.0.0.1:47615/status).
+// Muse Hub v2 multi-account sidebar card for the Antigravity desktop app.
+// Appended to antigravity-suite-client.js by append-pill.cjs (no app.asar edits).
+// Talks strictly to loopback Muse Hub (http://127.0.0.1:47617/admin/*) with
+// fallback to legacy http://127.0.0.1:47615/status.
 (() => {
   if (window.__museLinkPill) return
 
-  const DAEMON_STATUS = 'http://127.0.0.1:47615/status'
+  const HUB_ADMIN = 'http://127.0.0.1:47617'
+  const LEGACY_STATUS = 'http://127.0.0.1:47615/status'
   const POLL_MS = 10000
   const CARD_ID = 'muse-link-card'
 
@@ -21,31 +18,48 @@ background:var(--ag-ultra-sampled-bg,var(--ag-ultra-bg,rgba(30,34,40,.72)));
 -webkit-backdrop-filter:blur(14px) saturate(1.2);backdrop-filter:blur(14px) saturate(1.2);
 box-shadow:var(--ag-ultra-shadow,0 4px 18px rgba(0,0,0,.25));
 color:var(--ag-ultra-sampled-fg,var(--ag-ultra-fg,#e5e7eb));
-font:12px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif;
-padding:9px 12px;cursor:pointer;user-select:none;position:relative;overflow:hidden}
+font:11.5px/1.45 -apple-system,"Segoe UI",system-ui,sans-serif;
+padding:9px 11px;user-select:none;position:relative;overflow:hidden}
 #muse-link-card:hover{border-color:var(--ag-ultra-border-hover,rgba(96,165,250,.45))}
-#muse-link-card .mlc-head{display:flex;align-items:center;gap:8px}
-#muse-link-card .mlc-dot{width:8px;height:8px;border-radius:50%;background:#9ca3af;flex:none}
+#muse-link-card .mlc-head{display:flex;align-items:center;gap:7px;cursor:pointer}
+#muse-link-card .mlc-dot{width:7.5px;height:7.5px;border-radius:50%;background:#9ca3af;flex:none}
 #muse-link-card[data-mode="ok"] .mlc-dot{background:#34d399;box-shadow:0 0 6px #34d39988}
 #muse-link-card[data-mode="warn"] .mlc-dot{background:#fbbf24;box-shadow:0 0 6px #fbbf2488}
 #muse-link-card[data-mode="down"] .mlc-dot{background:#f87171;box-shadow:0 0 6px #f8717188}
-#muse-link-card .mlc-name{font-weight:600;letter-spacing:.02em;flex:none}
-#muse-link-card .mlc-state{margin-left:auto;opacity:.85;flex:none}
+#muse-link-card .mlc-name{font-weight:600;letter-spacing:.01em;flex:none}
+#muse-link-card .mlc-state{margin-left:auto;opacity:.82;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #muse-link-card .mlc-details{display:none;margin-top:7px;padding-top:7px;
-border-top:1px solid var(--ag-ultra-border,rgba(127,127,127,.22));font-size:11.5px}
-#muse-link-card.open .mlc-details{display:block}
-#muse-link-card .mlc-row{display:flex;justify-content:space-between;gap:10px;line-height:1.65}
+border-top:1px solid var(--ag-ultra-border,rgba(127,127,127,.22));font-size:11px;flex-direction:column;gap:5px}
+#muse-link-card.open .mlc-details{display:flex}
+#muse-link-card .mlc-row{display:flex;align-items:center;justify-content:space-between;gap:6px}
 #muse-link-card .mlc-k{opacity:.65;flex:none}
-#muse-link-card .mlc-v{text-align:right;word-break:break-all}
+#muse-link-card .mlc-v{text-align:right;word-break:break-all;opacity:.92}
+#muse-link-card .mlc-sec{font-size:10px;opacity:.6;margin-top:3px;letter-spacing:.03em}
+#muse-link-card .mlc-acc{display:flex;align-items:center;gap:5px}
+#muse-link-card .mlc-adot{width:7px;height:7px;border-radius:50%;background:#9ca3af;flex:none}
+#muse-link-card .mlc-adot[data-presence="active"]{background:#22c55e;box-shadow:0 0 6px #22c55eaa}
+#muse-link-card .mlc-adot[data-presence="online"]{background:#34d399}
+#muse-link-card .mlc-adot[data-presence="offline"]{background:#f87171}
+#muse-link-card .mlc-adot[data-presence="never"]{background:#9ca3af}
+#muse-link-card .mlc-pst{font-size:10px;opacity:.75;flex:none}
+#muse-link-card .mlc-pst[data-presence="active"],#muse-link-card .mlc-pst[data-presence="online"]{color:#34d399;opacity:1}
+#muse-link-card .mlc-pst[data-presence="offline"]{color:#f87171;opacity:.95}
+#muse-link-card .mlc-albl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#muse-link-card .mlc-badge{font-size:9.5px;padding:0 4px;border-radius:4px;background:rgba(96,165,250,.18);color:#93c5fd;flex:none}
+#muse-link-card .mlc-badge[data-role="collaborator"]{background:rgba(251,191,36,.18);color:#fcd34d}
+#muse-link-card .mlc-code{font-family:ui-monospace,Consolas,monospace;font-weight:700;letter-spacing:.08em;color:#34d399;cursor:pointer}
+#muse-link-card .mlc-acts{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+#muse-link-card .mlc-btn{flex:1 1 auto;padding:3px 6px;border-radius:6px;border:1px solid rgba(148,163,184,.28);
+background:rgba(255,255,255,.07);color:inherit;font-size:10.5px;cursor:pointer;text-align:center}
+#muse-link-card .mlc-btn:hover{background:rgba(255,255,255,.16)}
+#muse-link-card .mlc-rev{margin-left:auto;padding:1px 5px;border-radius:4px;border:1px solid rgba(248,113,113,.38);
+background:transparent;color:#fca5a5;font-size:9.5px;cursor:pointer;flex:none}
 `
 
   let mode = 'init'
-  let data = null
+  let overview = null
   let card = null
 
-  // Same anchoring strategy as the suite's sidebar widgets: find the
-  // sidebar footer rows (Settings/Customizations first, then Plugins/
-  // Skills/Automations) in the bottom-left and insert before them.
   function findAnchor() {
     const footerLabels = new Set(['Customizations', '自定义', 'Settings', '设置'])
     const fallbackLabels = new Set(['Plugins', '插件', 'Automations', '自动化', 'Skills', '技能'])
@@ -92,6 +106,11 @@ border-top:1px solid var(--ag-ultra-border,rgba(127,127,127,.22));font-size:11.5
     return { container: p, beforeNode: before }
   }
 
+  function detectCurrentConvId() {
+    const m = (window.location.href || '').match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i)
+    return m ? m[1] : null
+  }
+
   function ensureCard() {
     if (!document.getElementById('muse-link-card-style')) {
       const st = document.createElement('style')
@@ -106,22 +125,17 @@ border-top:1px solid var(--ag-ultra-border,rgba(127,127,127,.22));font-size:11.5
       card.setAttribute('translate', 'no')
       card.setAttribute('data-ag-localization-skip', 'true')
       card.setAttribute('data-mode', 'init')
-      card.title = 'Muse 直连状态（点击展开详情）'
+      card.title = 'Muse Hub v2 多账号通道（点击展开管理）'
       card.innerHTML =
         '<div class="mlc-head"><span class="mlc-dot"></span>' +
-        '<span class="mlc-name">Muse 直连</span>' +
+        '<span class="mlc-name">Muse Hub</span>' +
         '<span class="mlc-state">检测中…</span></div>' +
         '<div class="mlc-details"></div>'
-      card.addEventListener('click', () => card.classList.toggle('open'))
+      card.querySelector('.mlc-head').addEventListener('click', () => card.classList.toggle('open'))
     }
     return card
   }
 
-  // Mirror the Usage & Billing trigger card's *computed* style so this
-  // card always wears the exact same background/border/shadow the
-  // current skin paints on it (the skin overrides that card with
-  // sampled glass colors via !important rules keyed to its class, which
-  // a plain var() background cannot reproduce — it resolves to gray).
   function mirrorRefStyle(el) {
     const ref =
       document.querySelector('.dsh-ub-trigger') ||
@@ -156,32 +170,176 @@ border-top:1px solid var(--ag-ultra-border,rgba(127,127,127,.22));font-size:11.5
     mirrorRefStyle(el)
   }
 
-  function stateText() {
-    if (mode === 'ok') return '已连接'
-    if (mode === 'warn') return '应用未就绪'
-    if (mode === 'down') return '守护进程离线'
-    return '检测中…'
+  function mk(tag, cls, text) {
+    const el = document.createElement(tag)
+    if (cls) el.className = cls
+    if (text !== undefined) el.textContent = text
+    return el
   }
 
   function render() {
     const el = ensureCard()
     el.setAttribute('data-mode', mode)
-    el.querySelector('.mlc-state').textContent = stateText()
-    const rows = []
-    const row = (k, v) =>
-      rows.push(
-        `<div class="mlc-row"><span class="mlc-k">${k}</span><span class="mlc-v">${v ?? '—'}</span></div>`
-      )
-    if (data) {
-      row('机器', data.machine)
-      row('守护进程', data.version ? 'v' + data.version : null)
-      row('语言服务', data.lsVersion)
-      row('直连会话', data.conversations)
-      row('检查时间', new Date().toLocaleTimeString())
-    } else {
-      row('检查时间', new Date().toLocaleTimeString())
+    const stateNode = el.querySelector('.mlc-state')
+    const det = el.querySelector('.mlc-details')
+    det.innerHTML = ''
+
+    if (!overview) {
+      stateNode.textContent = mode === 'down' ? 'Hub 离线' : '检测中…'
+      det.appendChild(mk('div', 'mlc-row', '请确认本机 Muse Hub (:47617) 已启动'))
+      mount()
+      return
     }
-    el.querySelector('.mlc-details').innerHTML = rows.join('')
+
+    const active = (overview.accounts || []).filter((a) => a.status === 'active')
+    const online = active.filter((a) => a.online).length
+    const agyOk = Boolean(overview.agents?.antigravity?.available)
+    const dshOk = Boolean(overview.agents?.dsh?.available)
+    stateNode.textContent = `${active.length}号(${online}在线) · ${agyOk ? 'AGY✓' : 'AGY·'} ${dshOk ? 'DSH✓' : 'DSH·'}`
+
+    const addRow = (k, v) => {
+      const r = mk('div', 'mlc-row')
+      r.append(mk('span', 'mlc-k', k), mk('span', 'mlc-v', v == null ? '—' : String(v)))
+      det.appendChild(r)
+    }
+    addRow('入口', `${overview.tailnetIp || '—'}:${overview.tailnetPort || 47616}${overview.tailnetListening ? ' ✓' : ' (等待接管)'}`)
+    addRow('引擎', `Hub v${overview.version || '2.0'} · AGY ${overview.agents?.antigravity?.lsVersion || '—'}`)
+
+    det.appendChild(mk('div', 'mlc-sec', `已接入 Muse 账号 (${active.length})`))
+    if (active.length === 0) {
+      det.appendChild(mk('div', 'mlc-k', '暂无账号，点下方按钮生成配对码'))
+    } else {
+      const fmtAgo = (iso) => {
+        if (!iso) return '尚未通信'
+        const sec = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000))
+        if (sec < 60) return `${sec}秒前`
+        if (sec < 3600) return `${Math.floor(sec / 60)}分钟前`
+        return `${Math.floor(sec / 3600)}小时前`
+      }
+      for (const acc of active) {
+        const row = mk('div', 'mlc-acc')
+        const presence = acc.presence || (acc.online ? 'online' : 'never')
+        const dot = mk('span', 'mlc-adot')
+        dot.setAttribute('data-presence', presence)
+        const shortState =
+          presence === 'active'
+            ? '活跃'
+            : presence === 'online'
+              ? '在线'
+              : presence === 'offline'
+                ? '离线'
+                : '未连'
+        const pst = mk('span', 'mlc-pst', shortState)
+        pst.setAttribute('data-presence', presence)
+        row.title = `${acc.label} · ${shortState} · 最近通信：${fmtAgo(acc.lastContactAt)}`
+        const badge = mk('span', 'mlc-badge', acc.role === 'collaborator' ? '协作' : 'Owner')
+        badge.setAttribute('data-role', acc.role)
+        const rev = mk('button', 'mlc-rev', '吊销')
+        rev.onclick = async (ev) => {
+          ev.stopPropagation()
+          if (!window.confirm(`确认吊销 Muse 账号「${acc.label}」？`)) return
+          await fetch(`${HUB_ADMIN}/admin/accounts/${encodeURIComponent(acc.id)}/revoke`, { method: 'POST' })
+          void poll()
+        }
+        row.append(dot, mk('span', 'mlc-albl', acc.label), badge, pst, mk('span', 'mlc-k', `${acc.activeThreads || 0}窗`), rev)
+        det.appendChild(row)
+      }
+    }
+
+    const tickets = overview.tickets || []
+    if (tickets.length > 0) {
+      det.appendChild(mk('div', 'mlc-sec', '待配对码（点击复制）'))
+      for (const t of tickets) {
+        const row = mk('div', 'mlc-acc')
+        const code = mk('span', 'mlc-code', t.code)
+        code.onclick = (ev) => {
+          ev.stopPropagation()
+          try { navigator.clipboard.writeText(t.code) } catch {}
+          code.textContent = `${t.code} ✓`
+        }
+        row.append(code, mk('span', 'mlc-albl', `${t.label} (${t.role === 'collaborator' ? '协作' : 'Owner'})`))
+        det.appendChild(row)
+      }
+    }
+
+    const acts = mk('div', 'mlc-acts')
+    const btnOwner = mk('button', 'mlc-btn', '+ 主号码')
+    btnOwner.onclick = async (ev) => {
+      ev.stopPropagation()
+      const label = window.prompt('新 Muse 主号别名：', `Victor·号${active.length + 1}`)
+      if (label === null) return
+      await fetch(`${HUB_ADMIN}/admin/pairing-tickets`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ label: label.trim() || undefined, role: 'owner' }),
+      })
+      void poll()
+    }
+
+    const btnCollab = mk('button', 'mlc-btn', '+ 协作码')
+    btnCollab.onclick = async (ev) => {
+      ev.stopPropagation()
+      const label = window.prompt('协作账户别名：', '协作账户')
+      if (label === null) return
+      const ws = window.prompt('锁定单一沙箱目录（留空使用默认隔离目录）：', '')
+      if (ws === null) return
+      await fetch(`${HUB_ADMIN}/admin/pairing-tickets`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          label: label.trim() || '协作账户',
+          role: 'collaborator',
+          allowedAgents: ['dsh'],
+          ...(ws.trim() ? { workspaceRoots: [ws.trim()] } : {}),
+        }),
+      })
+      void poll()
+    }
+
+    const btnAttach = mk('button', 'mlc-btn', '挂载会话')
+    btnAttach.onclick = async (ev) => {
+      ev.stopPropagation()
+      const owners = active.filter((a) => a.role === 'owner')
+      if (!owners.length) {
+        window.alert('请先配对至少一个 Owner Muse 账号。')
+        return
+      }
+      let cid = detectCurrentConvId()
+      if (!cid) {
+        try {
+          const r = await fetch(`${HUB_ADMIN}/admin/local-sessions`).then((x) => x.json())
+          const top = (r.antigravity || []).slice(0, 6)
+          const hint = top.map((x, i) => `${i + 1}. ${x.localSessionId} (${x.preview || '无预览'})`).join('\n')
+          cid = window.prompt(`输入要挂载的 AGY 对话 UUID（默认最近一条）：\n${hint}`, top[0]?.localSessionId || '')
+        } catch {
+          cid = window.prompt('输入要挂载的 AGY 对话 UUID：', '')
+        }
+      }
+      if (!cid || !cid.trim()) return
+      const targetAcc =
+        owners.length === 1
+          ? owners[0].id
+          : window.prompt(
+              `选择目标 Owner 账号 ID：\n${owners.map((o) => `${o.id} (${o.label})`).join('\n')}`,
+              owners[0].id
+            )
+      if (!targetAcc) return
+      const res = await fetch(`${HUB_ADMIN}/admin/attach`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ accountId: targetAcc.trim(), agent: 'antigravity', localSessionId: cid.trim() }),
+      })
+      const j = await res.json().catch(() => ({}))
+      if (j.ok) {
+        window.alert(`已挂载到 ${targetAcc}，线程 ID：${j.thread?.id}`)
+        void poll()
+      } else {
+        window.alert(`挂载失败：${j.error?.message || res.status}`)
+      }
+    }
+
+    acts.append(btnOwner, btnCollab, btnAttach)
+    det.appendChild(acts)
     mount()
   }
 
@@ -189,17 +347,39 @@ border-top:1px solid var(--ag-ultra-border,rgba(127,127,127,.22));font-size:11.5
     try {
       const ctl = new AbortController()
       const timer = setTimeout(() => ctl.abort(), 3000)
-      const res = await fetch(DAEMON_STATUS, { signal: ctl.signal })
+      const res = await fetch(`${HUB_ADMIN}/admin/overview`, { signal: ctl.signal })
       clearTimeout(timer)
       const json = await res.json()
       if (json && json.ok) {
-        data = json
-        mode = json.hubPort ? 'ok' : 'warn'
+        overview = json
+        mode = json.agents?.antigravity?.available && json.tailnetListening ? 'ok' : 'warn'
       } else {
+        overview = null
         mode = 'down'
       }
     } catch (_e) {
-      mode = 'down'
+      try {
+        const res2 = await fetch(LEGACY_STATUS)
+        const j2 = await res2.json()
+        if (j2 && j2.ok) {
+          overview = {
+            version: j2.version,
+            tailnetIp: '100.x',
+            tailnetPort: 47616,
+            tailnetListening: Boolean(j2.tailnetListening),
+            agents: { antigravity: { available: Boolean(j2.hubPort), lsVersion: j2.lsVersion }, dsh: { available: Boolean(j2.dshAvailable) } },
+            accounts: [],
+            tickets: [],
+          }
+          mode = j2.hubPort ? 'ok' : 'warn'
+        } else {
+          overview = null
+          mode = 'down'
+        }
+      } catch {
+        overview = null
+        mode = 'down'
+      }
     }
     render()
   }
@@ -207,7 +387,6 @@ border-top:1px solid var(--ag-ultra-border,rgba(127,127,127,.22));font-size:11.5
   render()
   poll()
   setInterval(poll, POLL_MS)
-  // The app re-renders its sidebar often; keep the card mounted in flow.
   setInterval(mount, 3000)
 
   window.__museLinkPill = { refresh: poll }

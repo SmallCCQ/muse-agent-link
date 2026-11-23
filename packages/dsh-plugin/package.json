@@ -1,5 +1,5 @@
 {
-  "description": "Muse 直连通道插件：让 Muse (Victor) 经 Tailscale 直连本机 DeepSeek Harness，无第三方 IM 中转。状态卡 + 状态接口，通道协议见仓库 protocol/PROTOCOL.md。",
+  "description": "Muse Hub v2 DSH 薄适配插件：本地回环注册到独立 Muse Hub (:47617)，支持多 Muse 账号双向会话窗口、竞争审批与侧栏多账号管理。",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -25,5 +25,5 @@
   "main": "./index.js",
   "name": "@local/muse-agent-link",
   "type": "module",
-  "version": "0.6.0"
+  "version": "2.0.0"
 }

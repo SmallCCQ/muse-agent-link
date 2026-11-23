@@ -1,0 +1,30 @@
+{
+  "muse-agent-link-bridge": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node ./hooks/muse-hook.cjs",
+        "timeout": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./hooks/muse-hook.cjs",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./hooks/muse-hook.cjs",
+        "timeout": 5
+      }
+    ]
+  }
+}

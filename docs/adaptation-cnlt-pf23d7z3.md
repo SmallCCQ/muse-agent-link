@@ -101,3 +101,30 @@ PowerShell 5.1 misreads UTF-8-no-BOM scripts containing non-ASCII text
 and produces bogus parser errors. The bundle zip is assembled from
 packages/dsh-plugin + packages/daemon at build time; the copies in the
 bundle folder are build artifacts, not sources.
+
+## Upgrade to Muse Hub v2.0.0 (2026-11-23)
+
+- **Architecture**: Promoted `muse-hub.mjs` to a standalone local daemon owning
+  Tailscale `:47616`, loopback admin/internal `:47617`, and legacy pill compat
+  `:47615`. DSH plugin (`@local/muse-agent-link` v2.0.0) thinned to a pure
+  loopback Cordis adapter registering dynamically to `:47617` (auto-re-registers
+  in <1s on Hub reload and auto-launches `run-hub-hidden.vbs` if Hub is down).
+- **Zero-downtime migration**: Legacy `state.json` auto-migrated to
+  `acc_owner_victor` (`role: owner`); all 11 existing threads imported into
+  `bindings.json`; legacy `/api/muse-agent-link/*` routes preserved alongside
+  `/v2/*`.
+- **Silent autostart & single-instance lock**: `HKCU\...\Run\MuseAgentLinkDaemon`
+  updated to `wscript.exe "%USERPROFILE%\.dsh\muse-agent-link\run-hub-hidden.vbs"`
+  (no console flash), guarded by `hub.pid` single-instance lock and
+  `POST /admin/shutdown`.
+- **Antigravity native hooks + v2.0 pill**: Installed `PreInvocation`
+  (remote `/stop`, mid-turn `steer`, soft workspace hint), `PostToolUse`
+  (real-time progress), and `Stop` (<200ms instant `turn.finished`, eliminating
+  3.5s quiet wait) plus upgraded multi-account pill (`活跃 / 在线 / 离线 / 未连`)
+  into `~/.gemini/config/plugins/antigravity-muse-link`.
+- **Verified**: 19/19 automated E2E tests pass (`tests/e2e-test.mjs`,
+  `tests/agy-hook-test.mjs`, `tests/features-test.mjs`). Note on SSH root cause:
+  local loopback testing confirmed `sshd` immediately authenticates local
+  accounts (`advuser`) while rejecting/resetting domain account
+  (`adv\victor.cai` / UPN `victor.cai@advantest.com`) because neither LAN DNS
+  nor AnyConnect DNS resolves `_ldap._tcp.dc._msdcs.adv.advantest.com`.

@@ -1,1 +1,15 @@
-{"author":{"name":"Victor (Muse)"},"description":"在 Antigravity 桌面应用左下角显示 Muse 直连状态胶囊（已连接 / 应用未就绪 / 守护进程离线），数据来自本机 muse-agent-link 守护进程 http://127.0.0.1:47615/status。","displayName":"Antigravity Muse 直连状态","logo":"./assets/logo.svg","name":"antigravity-muse-link","title":"Antigravity Muse 直连状态","version":"1.2.0"}
+{
+  "author": {
+    "name": "Victor (Muse)"
+  },
+  "description": "Muse Hub v2 Antigravity 原生插件：提供 PreInvocation/PostToolUse/Stop 生命周期 Hook（实现秒级回合结束推送、远程 /stop 急停与盘中 steer 插话）以及左下角多账号 Muse Hub 管理胶囊。",
+  "displayName": "Antigravity Muse Hub v2",
+  "logo": "assets/logo.svg",
+  "name": "antigravity-muse-link",
+  "suggestedPrompts": [
+    "查看左下角 Muse Hub 多账号状态",
+    "重新安装或更新 Muse Hub 胶囊",
+    "检查本机 Muse Hub v2 是否在线"
+  ],
+  "version": "2.0.0"
+}

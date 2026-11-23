@@ -10,3 +10,5 @@ device-token*
 
 .env
 .env.*
+__pycache__/
+*.pyc

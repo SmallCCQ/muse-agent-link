@@ -39,7 +39,7 @@ All notable changes to `muse-agent-link` are documented in this file.
 ### Idle Wake Engine & Muse-Side v2 Client Kit
 - **Idle wake engine (`packages/daemon/wake.mjs`)**: Supports local WeChat push (`push_weixin.mjs`), built-in zero-dependency TLS/STARTTLS SMTP (`muse_mail`), and webhook modes with idle threshold & cooldown (`muse-admin.mjs wake / wake-test / smtp-set`).
 - **Muse-side zero-dependency client (`tools/muse_link_client.py` + `tools/MUSE_LINK_SKILL.md`)**: Pure Python3 stdlib over `:3130` `HTTP CONNECT` tunnel, automatic `<= 18s` long-poll slicing (`send --wait`), persisted account cursor, and self-bootstrapping download via `GET /v2/client.py` & `GET /v2/skill.md`.
-- **Workstation rollout & automated tests**: Added dual-mode `tools/install-office-v2.ps1`, SSH deployer `tools/deploy_v2_office.py`, and 19 automated E2E tests (`tests/e2e-test.mjs`, `tests/agy-hook-test.mjs`, `tests/features-test.mjs`).
+- **Workstation rollout & automated tests**: Deployed full v2.0.0 Hub, DSH `web` plugin, Antigravity hooks, and v2.0 pill to both `cnlt-pf23d7z3` and `office-workstation` (`DESKTOP-PRNM1F1` / `172.20.160.252`); added dual-mode `tools/install-office-v2.ps1`, SSH deployer `tools/deploy_v2_office.py`, and 19 automated E2E tests (`tests/e2e-test.mjs`, `tests/agy-hook-test.mjs`, `tests/features-test.mjs`).
 
 ---
 

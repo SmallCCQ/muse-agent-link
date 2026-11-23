@@ -161,3 +161,23 @@ M2 的 ACP 会话桌面端不可见，daemon 后端整体重写：
 - 实测：线程 bdd2ea9e… → 桌面会话 80b148d7-e2cd-46fa-a066-036facbc09f7，
   标题「Muse 直连 · 11-22 02:59」；两轮经完整通道验证 FINAL_OK / FINAL_OK2
   （第二轮走 RPC 追问）。另手工验证 RPC 直发得 RPC_OK。
+
+## Upgrade to Muse Hub v2.0.0 (2026-11-23)
+
+- **部署方式**：经局域网管理共享 `\\172.20.160.252\C$\Users\Smallsun` 全量备份并部署
+  （备份目录 `.dsh\muse-agent-link-backup-20261123-115316`）。
+- **已部署组件**：
+  1. **独立 Muse Hub v2**：`muse-hub.mjs`、`store.mjs`、`antigravity-adapter.mjs`、
+     `wake.mjs`（检测到本机已有 `push_weixin.mjs`）、`muse-admin.mjs`、
+     `run-hub-hidden.vbs`，并将 `run-daemon.cmd` 指向
+     `C:\Users\Smallsun\.dsh\muse-agent-link\muse-hub.mjs`。
+  2. **DSH `web` profile 插件 v2.0.0**：更新 `.dsh\plugins\muse-agent-link\`
+     （`profiles\web\node_modules\@local\muse-agent-link` 符号链接自动生效）：
+     薄回环适配器、离线自愈拉起 Hub、产物文件令牌回传、多账号侧栏卡片。
+  3. **Antigravity Desktop 插件 v2.0.0**：在 `.gemini\config\plugins\antigravity-muse-link\`
+     部署原生 `hooks.json` + `hooks/muse-hook.cjs`（`PreInvocation`/`PostToolUse`/`Stop`）
+     与新版 `pill.js`，并经本地 `node --check` 校验后安全刷入 `antigravity-suite-client.js`。
+- **生效动作**：重启 `dsh web`（DSH v2.0.0 启动后会自动拉起 `run-hub-hidden.vbs` →
+  `muse-hub.mjs` 并接管 `:47616`，自动无损迁移原有 `state.json` 与 `threads.json`）及
+  Antigravity 桌面端即可切换完成；也可直接由 1 号 Muse 运行 `python3 tools/deploy_v2_office.py`
+  或本机执行 `install-office-v2.ps1 -RestartDshWeb` 一键切换进程。

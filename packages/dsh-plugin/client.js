@@ -161,6 +161,23 @@ window.__ModuleLoader__.load({
           flex: 1 1 auto;
           min-width: 0;
         }
+        .mal-funnel-row {
+          display: flex;
+          align-items: center;
+          gap: 5px;
+          font-size: 11px;
+          padding: 3px 6px;
+          border-radius: 6px;
+          background: rgba(255,255,255,0.04);
+          border: 1px solid rgba(255,255,255,0.06);
+        }
+        .mal-funnel-link {
+          font-size: 10.5px;
+          color: #fcd34d;
+          cursor: pointer;
+          text-decoration: underline;
+          padding: 1px 2px;
+        }
       `
       document.head.appendChild(style)
     }
@@ -275,6 +292,61 @@ window.__ModuleLoader__.load({
         sec1.textContent = `已接入账号 (${activeAccounts.length}) · ${data.tailnetIp || 'no-tailnet'}:${data.tailnetPort}`
         panelEl.appendChild(sec1)
 
+        // Tailscale Funnel public collaborator gateway one-click toggle
+        const funnel = data.funnel || {}
+        const handleFunnelResult = (j) => {
+          if (!j) return
+          if (j.needsApproval && j.enableUrl) {
+            copyToClipboard(j.enableUrl)
+            try { window.open(j.enableUrl, '_blank', 'noopener') } catch {}
+            window.alert(
+              'Tailscale 首次启用公网 Funnel 需在浏览器控制台点一次「Enable Funnel」（一次性授权，链接已复制到剪贴板）：\n\n' +
+              j.enableUrl +
+              '\n\n授权完成后，点卡片上的「开启公网」即可自动生效。'
+            )
+          } else if (!j.ok && j.message) {
+            window.alert('公网 Funnel 操作失败：' + j.message)
+          }
+        }
+        const fRow = document.createElement('div')
+        fRow.className = 'mal-funnel-row'
+        const fDot = document.createElement('span')
+        fDot.className = 'mal-dot'
+        fDot.setAttribute('data-presence', funnel.active ? 'active' : 'never')
+        const fLbl = document.createElement('span')
+        fLbl.className = 'mal-tkt-lbl'
+        fLbl.textContent = funnel.active ? '公网协作 (Funnel) · 已开启' : '公网协作 (Funnel) · 未开启'
+        fLbl.title = funnel.url ? `${funnel.url} → ${funnel.target || '127.0.0.1:47619'}` : '无需对方加入 Tailscale 的受限 DSH 入口'
+        const fBtn = document.createElement('button')
+        fBtn.className = funnel.active ? 'mal-btn-mini' : 'mal-btn-copy'
+        fBtn.textContent = funnel.active ? '关闭公网' : '开启公网'
+        fBtn.onclick = async (ev) => {
+          ev.stopPropagation()
+          fBtn.disabled = true
+          fBtn.textContent = funnel.active ? '关闭中…' : '开启中…'
+          try {
+            const ep = funnel.active ? '/api/muse-agent-link/admin-funnel-disable' : '/api/muse-agent-link/admin-funnel-enable'
+            const r = await fetch(ep, { method: 'POST' })
+            const j = await r.json().catch(() => null)
+            handleFunnelResult(j)
+          } finally {
+            void refreshState()
+          }
+        }
+        fRow.append(fDot, fLbl, fBtn)
+        panelEl.appendChild(fRow)
+        if (!funnel.active && funnel.enableUrl) {
+          const fLink = document.createElement('div')
+          fLink.className = 'mal-funnel-link'
+          fLink.textContent = '↗ 点此去 Tailscale 控制台启用 Funnel（一次性授权）'
+          fLink.onclick = (ev) => {
+            ev.stopPropagation()
+            copyToClipboard(funnel.enableUrl)
+            try { window.open(funnel.enableUrl, '_blank', 'noopener') } catch {}
+          }
+          panelEl.appendChild(fLink)
+        }
+
         if (activeAccounts.length === 0) {
           const empty = document.createElement('div')
           empty.style.opacity = '0.7'
@@ -327,6 +399,12 @@ window.__ModuleLoader__.load({
               ev.stopPropagation()
               if (!window.confirm(`确认吊销 Muse 账号「${acc.label}」？`)) return
               await fetch(`/api/muse-agent-link/admin-revoke?id=${encodeURIComponent(acc.id)}`, { method: 'POST' })
+              const remainCollab = activeAccounts.filter((x) => x.role === 'collaborator' && x.id !== acc.id).length
+              if (acc.role === 'collaborator' && remainCollab === 0 && funnel.active) {
+                if (window.confirm('当前已无活跃协作账号，是否顺手关闭公网 Funnel 入口？')) {
+                  await fetch('/api/muse-agent-link/admin-funnel-disable', { method: 'POST' }).catch(() => {})
+                }
+              }
               void refreshState()
             }
             row.append(d, name, badge, pst, cnt, rev)
@@ -409,6 +487,11 @@ window.__ModuleLoader__.load({
               ...(ws.trim() ? { workspaceRoots: [ws.trim()] } : {}),
             }),
           })
+          if (!funnel.active) {
+            const fr = await fetch('/api/muse-agent-link/admin-funnel-enable', { method: 'POST' }).catch(() => null)
+            const fj = fr ? await fr.json().catch(() => null) : null
+            handleFunnelResult(fj)
+          }
           void refreshState()
         }
 

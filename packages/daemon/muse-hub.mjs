@@ -31,6 +31,8 @@ const ADMIN_PORT = Number(process.env.MUSE_HUB_ADMIN_PORT || 47617)
 const LEGACY_PORT = Number(process.env.MUSE_HUB_LEGACY_PORT || 47615)
 const COLLAB_PORT =
   process.env.MUSE_HUB_COLLAB_PORT !== undefined ? Number(process.env.MUSE_HUB_COLLAB_PORT) : 47619
+const TAILSCALE_BIN = process.env.MUSE_TAILSCALE_BIN || 'tailscale'
+const TAILSCALE_CLI_DISABLED = process.env.MUSE_DISABLE_TAILSCALE_CLI === '1'
 const LOG_PATH = path.join(STATE_DIR, 'hub.log')
 const PID_PATH = path.join(STATE_DIR, 'hub.pid')
 const MAX_BODY_BYTES = 2 * 1024 * 1024
@@ -139,20 +141,206 @@ function tailscaleIpv4() {
 }
 
 let cachedTailnetDns = null
-function refreshTailnetDns() {
+const funnelState = {
+  active: false,
+  target: null,
+  enableUrl: null,
+  lastCheckedAt: null,
+  lastError: null,
+}
+
+function parseFunnelStatusJson(obj, collabPort) {
+  if (!obj || typeof obj !== 'object') return { active: false, target: null }
+  const allow = obj.AllowFunnel && typeof obj.AllowFunnel === 'object' ? obj.AllowFunnel : {}
+  const web = obj.Web && typeof obj.Web === 'object' ? obj.Web : {}
+  for (const [hostPort, enabled] of Object.entries(allow)) {
+    if (!enabled) continue
+    const handlers = web[hostPort]?.Handlers || {}
+    for (const h of Object.values(handlers)) {
+      const proxy = String(h?.Proxy || '')
+      if (proxy && proxy.includes(`:${collabPort}`)) {
+        return { active: true, target: proxy }
+      }
+    }
+  }
+  return { active: false, target: null }
+}
+
+function getFunnelPublicState() {
+  return {
+    active: funnelState.active,
+    url: cachedTailnetDns ? `https://${cachedTailnetDns}` : null,
+    target: funnelState.target || (COLLAB_PORT > 0 ? `http://127.0.0.1:${COLLAB_PORT}` : null),
+    enableUrl: funnelState.active ? null : funnelState.enableUrl,
+    lastCheckedAt: funnelState.lastCheckedAt,
+    lastError: funnelState.lastError,
+  }
+}
+
+function tailscaleExecSpec(args) {
+  if (/\.(m?js|cjs)$/i.test(TAILSCALE_BIN)) {
+    return { bin: process.execPath, argv: [TAILSCALE_BIN, ...args] }
+  }
+  return { bin: TAILSCALE_BIN, argv: args }
+}
+
+function execTailscale(args, timeoutMs = 4500) {
+  return new Promise((resolve) => {
+    if (TAILSCALE_CLI_DISABLED) {
+      resolve({ ok: false, code: -1, stdout: '', stderr: 'tailscale cli disabled' })
+      return
+    }
+    try {
+      const { bin, argv } = tailscaleExecSpec(args)
+      execFile(bin, argv, { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+        resolve({
+          ok: !err,
+          code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+          stdout: String(stdout || ''),
+          stderr: String(stderr || ''),
+        })
+      })
+    } catch (err) {
+      resolve({ ok: false, code: 1, stdout: '', stderr: String(err?.message || err) })
+    }
+  })
+}
+
+async function refreshTailnetDns() {
+  const r = await execTailscale(['status', '--json'], 4000)
+  if (!r.ok || !r.stdout) return
   try {
-    execFile('tailscale', ['status', '--json'], { timeout: 4000, windowsHide: true }, (err, stdout) => {
-      if (err || !stdout) return
-      try {
-        const st = JSON.parse(stdout)
-        const dns = String(st?.Self?.DNSName || '').replace(/\.+$/, '').trim()
-        if (dns) cachedTailnetDns = dns
-      } catch {}
-    })
+    const st = JSON.parse(r.stdout)
+    const dns = String(st?.Self?.DNSName || '').replace(/\.+$/, '').trim()
+    if (dns) cachedTailnetDns = dns
   } catch {}
 }
-refreshTailnetDns()
-const tailnetDnsTimer = setInterval(refreshTailnetDns, 60_000)
+
+async function refreshFunnelStatus() {
+  if (TAILSCALE_CLI_DISABLED || !Number.isInteger(COLLAB_PORT) || COLLAB_PORT <= 0) return getFunnelPublicState()
+  const r = await execTailscale(['funnel', 'status', '--json'], 4500)
+  funnelState.lastCheckedAt = new Date().toISOString()
+  if (r.ok && r.stdout.trim()) {
+    try {
+      const parsed = parseFunnelStatusJson(JSON.parse(r.stdout), COLLAB_PORT)
+      funnelState.active = parsed.active
+      funnelState.target = parsed.target
+      if (parsed.active) {
+        funnelState.enableUrl = null
+        funnelState.lastError = null
+      }
+    } catch {}
+  }
+  return getFunnelPublicState()
+}
+
+async function enableTailscaleFunnel() {
+  if (TAILSCALE_CLI_DISABLED) {
+    return { ok: false, code: 'disabled', message: 'Tailscale CLI integration is disabled.', funnel: getFunnelPublicState() }
+  }
+  if (!Number.isInteger(COLLAB_PORT) || COLLAB_PORT <= 0 || !collabServer?.listening) {
+    return { ok: false, code: 'collab_offline', message: 'Collaborator gateway port is not listening.', funnel: getFunnelPublicState() }
+  }
+  await refreshTailnetDns()
+
+  const outcome = await new Promise((resolve) => {
+    let settled = false
+    let combined = ''
+    let child
+    try {
+      const { bin, argv } = tailscaleExecSpec(['funnel', '--bg', String(COLLAB_PORT)])
+      child = spawn(bin, argv, {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (err) {
+      resolve({ code: 1, output: String(err?.message || err), timedOut: false, enableUrl: null })
+      return
+    }
+    const finish = (res) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { child.kill() } catch {}
+      resolve(res)
+    }
+    const checkUrl = () => {
+      const m = combined.match(/https:\/\/login\.tailscale\.com\/\S+/i)
+      if (m) {
+        const cleanUrl = m[0].replace(/[.,;)\]]+$/, '')
+        setTimeout(() => finish({ code: 1, output: combined, timedOut: false, enableUrl: cleanUrl }), 120)
+      }
+    }
+    child.stdout?.on('data', (d) => { combined += d.toString(); checkUrl() })
+    child.stderr?.on('data', (d) => { combined += d.toString(); checkUrl() })
+    child.on('error', (err) => finish({ code: 1, output: String(err?.message || err), timedOut: false, enableUrl: null }))
+    child.on('close', (code) => {
+      const m = combined.match(/https:\/\/login\.tailscale\.com\/\S+/i)
+      finish({ code: code ?? 1, output: combined, timedOut: false, enableUrl: m ? m[0].replace(/[.,;)\]]+$/, '') : null })
+    })
+    const timer = setTimeout(() => {
+      const m = combined.match(/https:\/\/login\.tailscale\.com\/\S+/i)
+      finish({ code: 1, output: combined, timedOut: true, enableUrl: m ? m[0].replace(/[.,;)\]]+$/, '') : null })
+    }, 6000)
+  })
+
+  if (outcome.enableUrl) {
+    funnelState.active = false
+    funnelState.enableUrl = outcome.enableUrl
+    funnelState.lastError = 'Funnel needs one-time approval in Tailscale Admin console.'
+    store.audit('funnel.needs_approval', { enableUrl: outcome.enableUrl })
+    return {
+      ok: false,
+      needsApproval: true,
+      enableUrl: outcome.enableUrl,
+      message: 'Tailscale Funnel 尚未在控制台启用，请先打开链接点一次 Enable Funnel。',
+      funnel: getFunnelPublicState(),
+    }
+  }
+
+  await refreshFunnelStatus()
+  if (outcome.code === 0 || funnelState.active) {
+    funnelState.active = true
+    funnelState.enableUrl = null
+    funnelState.lastError = null
+    store.audit('funnel.enabled', { port: COLLAB_PORT, url: getFunnelPublicState().url })
+    log(`[hub] Tailscale Funnel enabled -> 127.0.0.1:${COLLAB_PORT} (${getFunnelPublicState().url || 'ok'})`)
+    return { ok: true, funnel: getFunnelPublicState() }
+  }
+
+  funnelState.lastError = outcome.output.trim().slice(0, 300) || (outcome.timedOut ? 'tailscale funnel timed out' : 'tailscale funnel failed')
+  return {
+    ok: false,
+    needsApproval: false,
+    message: funnelState.lastError,
+    funnel: getFunnelPublicState(),
+  }
+}
+
+async function disableTailscaleFunnel() {
+  if (TAILSCALE_CLI_DISABLED) {
+    return { ok: false, code: 'disabled', message: 'Tailscale CLI integration is disabled.', funnel: getFunnelPublicState() }
+  }
+  const r = await execTailscale(['funnel', '--https=443', 'off'], 8000)
+  await refreshFunnelStatus()
+  if (r.ok || !funnelState.active) {
+    funnelState.active = false
+    funnelState.target = null
+    funnelState.lastError = null
+    store.audit('funnel.disabled', { port: COLLAB_PORT })
+    log('[hub] Tailscale Funnel disabled (--https=443 off)')
+    return { ok: true, funnel: getFunnelPublicState() }
+  }
+  funnelState.lastError = (r.stderr || r.stdout || 'tailscale funnel off failed').trim().slice(0, 300)
+  return { ok: false, message: funnelState.lastError, funnel: getFunnelPublicState() }
+}
+
+void refreshTailnetDns()
+void refreshFunnelStatus()
+const tailnetDnsTimer = setInterval(() => {
+  void refreshTailnetDns()
+  void refreshFunnelStatus()
+}, 30_000)
 tailnetDnsTimer.unref?.()
 
 function formatStamp() {
@@ -1469,6 +1657,7 @@ async function handleAdminAndInternal(req, res, url) {
       tailnetListening: Boolean(tailnetServer?.listening),
       tailnetDnsName: cachedTailnetDns,
       funnelUrl: cachedTailnetDns ? `https://${cachedTailnetDns}` : null,
+      funnel: getFunnelPublicState(),
       collabPort: COLLAB_PORT > 0 ? COLLAB_PORT : null,
       collabListening: Boolean(collabServer?.listening),
       agents: buildPublicStatus().agents,
@@ -1576,6 +1765,25 @@ async function handleAdminAndInternal(req, res, url) {
   if (p === '/admin/shutdown' && req.method === 'POST') {
     sendJson(res, 200, { ok: true, shuttingDown: true, pid: process.pid })
     setTimeout(() => shutdown('ADMIN_SHUTDOWN'), 100)
+    return
+  }
+
+  if (p === '/admin/funnel/status' && req.method === 'GET') {
+    await refreshTailnetDns()
+    const funnel = await refreshFunnelStatus()
+    sendJson(res, 200, { ok: true, funnel })
+    return
+  }
+
+  if (p === '/admin/funnel/enable' && req.method === 'POST') {
+    const result = await enableTailscaleFunnel()
+    sendJson(res, 200, result)
+    return
+  }
+
+  if (p === '/admin/funnel/disable' && req.method === 'POST') {
+    const result = await disableTailscaleFunnel()
+    sendJson(res, 200, result)
     return
   }
 

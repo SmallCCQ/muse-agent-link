@@ -28,6 +28,51 @@ fs.mkdirSync(collabSandbox, { recursive: true })
 fs.writeFileSync(path.join(collabSandbox, 'ok.txt'), 'COLLAB_FUNNEL_OK', 'utf8')
 fs.writeFileSync(path.join(tmpDir, 'outside.txt'), 'SECRET_OUTSIDE', 'utf8')
 
+// Deterministic mock Tailscale CLI so tests verify Funnel approval/enable/disable without touching real Tailscale
+const mockTsStatePath = path.join(tmpDir, 'mock-tailscale-state.json')
+fs.writeFileSync(mockTsStatePath, JSON.stringify({ approved: false, active: false }), 'utf8')
+const mockTsScript = path.join(tmpDir, 'mock-tailscale.mjs')
+fs.writeFileSync(
+  mockTsScript,
+  `import fs from 'node:fs'
+const stPath = ${JSON.stringify(mockTsStatePath)}
+const st = JSON.parse(fs.readFileSync(stPath, 'utf8'))
+const args = process.argv.slice(2)
+if (args[0] === 'status' && args[1] === '--json') {
+  console.log(JSON.stringify({ Self: { DNSName: 'mock-office.tailtest.ts.net.' } }))
+  process.exit(0)
+}
+if (args[0] === 'funnel' && args[1] === 'status' && args[2] === '--json') {
+  if (!st.active) {
+    console.log('{}')
+  } else {
+    console.log(JSON.stringify({
+      AllowFunnel: { 'mock-office.tailtest.ts.net:443': true },
+      Web: { 'mock-office.tailtest.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:${TEST_COLLAB_PORT}' } } } },
+    }))
+  }
+  process.exit(0)
+}
+if (args[0] === 'funnel' && args[1] === '--bg') {
+  if (!st.approved) {
+    process.stdout.write('\\nFunnel is not enabled on your tailnet.\\nTo enable, visit:\\n\\n\\t https://login.tailscale.com/f/funnel?node=mockNode123\\n\\n')
+    setTimeout(() => process.exit(1), 15000)
+  } else {
+    st.active = true
+    fs.writeFileSync(stPath, JSON.stringify(st), 'utf8')
+    console.log('Available on the internet: https://mock-office.tailtest.ts.net/')
+    process.exit(0)
+  }
+}
+if (args[0] === 'funnel' && args.includes('off')) {
+  st.active = false
+  fs.writeFileSync(stPath, JSON.stringify(st), 'utf8')
+  process.exit(0)
+}
+`,
+  'utf8'
+)
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 async function api(base, method, pathname, { body, token, headers = {} } = {}) {
@@ -130,6 +175,7 @@ const hubProc = spawn(process.execPath, [HUB_ENTRY], {
     MUSE_HUB_LEGACY_PORT: String(TEST_LEGACY_PORT),
     MUSE_HUB_TAILNET_PORT: String(TEST_TAILNET_PORT),
     MUSE_HUB_COLLAB_PORT: String(TEST_COLLAB_PORT),
+    MUSE_TAILSCALE_BIN: mockTsScript,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 })
@@ -436,7 +482,34 @@ try {
   assert.ok(proxyConnectCalls >= 5, `Expected HTTPS_PROXY CONNECT to be used on all HTTPS calls, got ${proxyConnectCalls}`)
   console.log(`[PASS] 7. Python muse_link_client.py HTTPS + TLS SNI + standard HTTPS_PROXY CONNECT E2E passed (${proxyConnectCalls} proxied TLS requests)`)
 
-  console.log('\nALL 7 COLLABORATOR GATEWAY & HTTPS E2E SUITES PASSED!')
+  // 8. Built-in Tailscale Funnel management (/admin/funnel/enable -> needsApproval -> enable -> disable)
+  const fNeed = await api(ADMIN_BASE, 'POST', '/admin/funnel/enable')
+  assert.equal(fNeed.status, 200)
+  assert.equal(fNeed.data.ok, false)
+  assert.equal(fNeed.data.needsApproval, true)
+  assert.equal(fNeed.data.enableUrl, 'https://login.tailscale.com/f/funnel?node=mockNode123')
+  assert.equal(fNeed.data.funnel.active, false)
+
+  // Simulate user clicking Enable Funnel once in Tailscale Admin console
+  fs.writeFileSync(mockTsStatePath, JSON.stringify({ approved: true, active: false }), 'utf8')
+  const fOn = await api(ADMIN_BASE, 'POST', '/admin/funnel/enable')
+  assert.equal(fOn.status, 200)
+  assert.equal(fOn.data.ok, true)
+  assert.equal(fOn.data.funnel.active, true)
+  assert.equal(fOn.data.funnel.url, 'https://mock-office.tailtest.ts.net')
+  assert.equal(fOn.data.funnel.enableUrl, null)
+
+  const ovAfterOn = await api(ADMIN_BASE, 'GET', '/admin/overview')
+  assert.equal(ovAfterOn.data.funnel.active, true)
+  assert.equal(ovAfterOn.data.funnelUrl, 'https://mock-office.tailtest.ts.net')
+
+  const fOff = await api(ADMIN_BASE, 'POST', '/admin/funnel/disable')
+  assert.equal(fOff.status, 200)
+  assert.equal(fOff.data.ok, true)
+  assert.equal(fOff.data.funnel.active, false)
+  console.log('[PASS] 8. Built-in Tailscale Funnel enable/approval-link/disable lifecycle verified')
+
+  console.log('\nALL 8 COLLABORATOR GATEWAY & HTTPS E2E SUITES PASSED!')
 } finally {
   try { mockConnectProxy?.close() } catch {}
   try { tlsProxyServer?.close() } catch {}

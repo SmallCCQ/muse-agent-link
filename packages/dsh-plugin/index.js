@@ -712,6 +712,16 @@ export function apply(ctx) {
     path: '/api/muse-agent-link/admin-attach',
     handler: (req, res) => proxyToHub(req, res, '/admin/attach', 'POST'),
   })
+  registerSafe({
+    kind: 'exact',
+    path: '/api/muse-agent-link/admin-funnel-enable',
+    handler: (req, res) => proxyToHub(req, res, '/admin/funnel/enable', 'POST'),
+  })
+  registerSafe({
+    kind: 'exact',
+    path: '/api/muse-agent-link/admin-funnel-disable',
+    handler: (req, res) => proxyToHub(req, res, '/admin/funnel/disable', 'POST'),
+  })
 
   ctx.on('dispose', () => {
     if (heartbeatTimer) clearInterval(heartbeatTimer)

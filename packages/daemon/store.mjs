@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-export const HUB_VERSION = '2.1.0'
+export const HUB_VERSION = '2.1.1'
 export const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 export const STATE_DIR = process.env.MUSE_LINK_STATE_DIR || path.join(DSH_HOME, 'muse-agent-link')
 export const DEFAULT_WORKSPACE = path.join(STATE_DIR, 'workspace')

@@ -2,6 +2,19 @@
 
 All notable changes to `muse-agent-link` are documented in this file.
 
+## [2.1.1] - 2026-11-24 — Built-In Tailscale Funnel One-Click Toggle & Auto-Enable
+
+- **Hub-managed Tailscale Funnel lifecycle (`packages/daemon/muse-hub.mjs`)**:
+  - Polls `tailscale funnel status --json` (non-blocking) and exposes live `funnel: { active, url, target, enableUrl }` in `GET /admin/overview`.
+  - Added loopback-only `POST /admin/funnel/enable` (`tailscale funnel --bg 47619`), `POST /admin/funnel/disable` (`tailscale funnel --https=443 off`), and `GET /admin/funnel/status`.
+  - Automatically captures Tailscale's one-time console authorization link (`https://login.tailscale.com/f/funnel?...`) without hanging when Funnel has not yet been enabled on the tailnet.
+- **Zero-CLI collaborator setup in DSH & Antigravity sidebar plugins (`packages/dsh-plugin/` & `packages/agy-status-pill/` v2.1.1)**:
+  - Added a live **「公网协作 (Funnel)」** status row with one-click **「开启公网 / 关闭公网」** button and clickable Tailscale console enablement link if one-time approval is pending.
+  - Clicking **「+ 协作配对码」** automatically enables Tailscale Funnel (or opens + copies the one-time approval URL); revoking the last active collaborator offers to turn off public Funnel in one click.
+- **Automated Funnel lifecycle E2E test (`tests/collab-gateway-test.mjs`)**: Added deterministic mock-CLI test verifying `needsApproval` URL capture, enable (`active: true`), and disable (`active: false`) — total **27/27** E2E tests passing.
+
+---
+
 ## [2.1.0] - 2026-11-24 — Collaborator-Only Funnel Gateway (`:47619`) & Native HTTPS Client
 
 ### Security & Network Isolation (Zero-Tailscale Collaborator Access)

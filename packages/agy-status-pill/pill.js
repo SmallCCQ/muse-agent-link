@@ -57,6 +57,9 @@ background:transparent;color:#fca5a5;font-size:9.5px;cursor:pointer;flex:none}
 #muse-link-card .mlc-copy{margin-left:auto;padding:1px 6px;border-radius:4px;border:1px solid rgba(52,211,153,.42);
 background:rgba(52,211,153,.12);color:#6ee7b7;font-size:9.5px;cursor:pointer;flex:none;white-space:nowrap}
 #muse-link-card .mlc-copy:hover{background:rgba(52,211,153,.24)}
+#muse-link-card .mlc-funnel{display:flex;align-items:center;gap:5px;padding:3px 6px;border-radius:6px;
+background:rgba(255,255,255,.04);border:1px solid rgba(148,163,184,.16);margin-top:2px}
+#muse-link-card .mlc-flink{font-size:10px;color:#fcd34d;cursor:pointer;text-decoration:underline;padding:1px 2px}
 `
 
   let mode = 'init'
@@ -269,6 +272,53 @@ background:rgba(52,211,153,.12);color:#6ee7b7;font-size:9.5px;cursor:pointer;fle
     addRow('入口', `${overview.tailnetIp || '—'}:${overview.tailnetPort || 47616}${overview.tailnetListening ? ' ✓' : ' (等待接管)'}`)
     addRow('引擎', `Hub v${overview.version || '2.0'} · AGY ${overview.agents?.antigravity?.lsVersion || '—'}`)
 
+    const funnel = overview.funnel || {}
+    const handleFunnelResult = (j) => {
+      if (!j) return
+      if (j.needsApproval && j.enableUrl) {
+        copyToClipboard(j.enableUrl)
+        try { window.open(j.enableUrl, '_blank', 'noopener') } catch {}
+        window.alert(
+          'Tailscale 首次启用公网 Funnel 需在浏览器控制台点一次「Enable Funnel」（一次性授权，链接已复制到剪贴板）：\n\n' +
+          j.enableUrl +
+          '\n\n授权完成后，点卡片上的「开启公网」即可自动生效。'
+        )
+      } else if (!j.ok && j.message) {
+        window.alert('公网 Funnel 操作失败：' + j.message)
+      }
+    }
+    const fRow = mk('div', 'mlc-funnel')
+    const fDot = mk('span', 'mlc-adot')
+    fDot.setAttribute('data-presence', funnel.active ? 'active' : 'never')
+    const fLbl = mk('span', 'mlc-albl', funnel.active ? '公网协作 · 已开启' : '公网协作 · 未开启')
+    fLbl.style.flex = '1 1 auto'
+    fLbl.title = funnel.url ? `${funnel.url} → ${funnel.target || '127.0.0.1:47619'}` : '无需对方加入 Tailscale 的受限 DSH 入口'
+    const fBtn = mk('button', funnel.active ? 'mlc-rev' : 'mlc-copy', funnel.active ? '关闭公网' : '开启公网')
+    fBtn.onclick = async (ev) => {
+      ev.stopPropagation()
+      fBtn.disabled = true
+      fBtn.textContent = funnel.active ? '关闭中…' : '开启中…'
+      try {
+        const ep = funnel.active ? `${HUB_ADMIN}/admin/funnel/disable` : `${HUB_ADMIN}/admin/funnel/enable`
+        const r = await fetch(ep, { method: 'POST' })
+        const j = await r.json().catch(() => null)
+        handleFunnelResult(j)
+      } finally {
+        void poll()
+      }
+    }
+    fRow.append(fDot, fLbl, fBtn)
+    det.appendChild(fRow)
+    if (!funnel.active && funnel.enableUrl) {
+      const fLink = mk('div', 'mlc-flink', '↗ 点此去 Tailscale 控制台启用 Funnel（一次性授权）')
+      fLink.onclick = (ev) => {
+        ev.stopPropagation()
+        copyToClipboard(funnel.enableUrl)
+        try { window.open(funnel.enableUrl, '_blank', 'noopener') } catch {}
+      }
+      det.appendChild(fLink)
+    }
+
     det.appendChild(mk('div', 'mlc-sec', `已接入 Muse 账号 (${active.length})`))
     if (active.length === 0) {
       det.appendChild(mk('div', 'mlc-k', '暂无账号，点下方按钮生成配对码'))
@@ -303,6 +353,12 @@ background:rgba(52,211,153,.12);color:#6ee7b7;font-size:9.5px;cursor:pointer;fle
           ev.stopPropagation()
           if (!window.confirm(`确认吊销 Muse 账号「${acc.label}」？`)) return
           await fetch(`${HUB_ADMIN}/admin/accounts/${encodeURIComponent(acc.id)}/revoke`, { method: 'POST' })
+          const remainCollab = active.filter((x) => x.role === 'collaborator' && x.id !== acc.id).length
+          if (acc.role === 'collaborator' && remainCollab === 0 && funnel.active) {
+            if (window.confirm('当前已无活跃协作账号，是否顺手关闭公网 Funnel 入口？')) {
+              await fetch(`${HUB_ADMIN}/admin/funnel/disable`, { method: 'POST' }).catch(() => {})
+            }
+          }
           void poll()
         }
         row.append(dot, mk('span', 'mlc-albl', acc.label), badge, pst, mk('span', 'mlc-k', `${acc.activeThreads || 0}窗`), rev)
@@ -369,6 +425,11 @@ background:rgba(52,211,153,.12);color:#6ee7b7;font-size:9.5px;cursor:pointer;fle
           ...(ws.trim() ? { workspaceRoots: [ws.trim()] } : {}),
         }),
       })
+      if (!funnel.active) {
+        const fr = await fetch(`${HUB_ADMIN}/admin/funnel/enable`, { method: 'POST' }).catch(() => null)
+        const fj = fr ? await fr.json().catch(() => null) : null
+        handleFunnelResult(fj)
+      }
       void poll()
     }
 

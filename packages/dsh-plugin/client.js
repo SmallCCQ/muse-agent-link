@@ -138,9 +138,92 @@ window.__ModuleLoader__.load({
           color: #fca5a5;
           font-size: 10px;
           cursor: pointer;
+          flex: none;
+        }
+        .mal-btn-copy {
+          margin-left: auto;
+          padding: 1px 6px;
+          border-radius: 4px;
+          border: 1px solid rgba(52,211,153,0.42);
+          background: rgba(52,211,153,0.12);
+          color: #6ee7b7;
+          font-size: 10px;
+          cursor: pointer;
+          flex: none;
+          white-space: nowrap;
+        }
+        .mal-btn-copy:hover { background: rgba(52,211,153,0.24); }
+        .mal-tkt-lbl {
+          opacity: 0.82;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          flex: 1 1 auto;
+          min-width: 0;
         }
       `
       document.head.appendChild(style)
+    }
+
+    function copyToClipboard(text) {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(text).catch(() => fallbackCopy(text))
+      } else {
+        fallbackCopy(text)
+      }
+    }
+
+    function fallbackCopy(text) {
+      try {
+        const ta = document.createElement('textarea')
+        ta.value = text
+        ta.style.position = 'fixed'
+        ta.style.left = '-9999px'
+        ta.style.top = '0'
+        document.body.appendChild(ta)
+        ta.focus()
+        ta.select()
+        document.execCommand('copy')
+        ta.remove()
+      } catch {}
+    }
+
+    function buildOnboardingPrompt(ticket, ov) {
+      const dnsName = String(ov?.tailnetDnsName || '').replace(/\.+$/, '')
+      const rawHost = dnsName ? dnsName.split('.')[0] : String(ov?.machine || 'pc')
+      const baseSlug = rawHost.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'pc'
+      if (ticket.role === 'collaborator') {
+        const slug = `${baseSlug}-collab`
+        const funnelUrl = ov?.funnelUrl || (dnsName ? `https://${dnsName}` : 'https://<本机Tailscale域名>')
+        return [
+          '请帮我连接一个受限的远程 DSH 协作工作区（公网 HTTPS 网关，无需 Tailscale）：',
+          '1. 下载客户端并配对：',
+          'mkdir -p ~/.muse-link/credentials ~/.muse-link/state',
+          'curl -fsSL https://raw.githubusercontent.com/SmallCCQ/muse-agent-link/main/tools/muse_link_client.py -o ~/.muse-link/muse_link_client.py',
+          `python3 ~/.muse-link/muse_link_client.py --machine ${slug} --url ${funnelUrl} pair --code ${ticket.code}`,
+          `python3 ~/.muse-link/muse_link_client.py --machine ${slug} me`,
+          '',
+          `2. 后续所有操作均使用 --machine ${slug}（仅允许 --agent dsh，不要使用 antigravity）：`,
+          `- 开窗/复用：python3 ~/.muse-link/muse_link_client.py --machine ${slug} open --agent dsh --window-key "topic:main" --title "协作对话"`,
+          `- 发送并等待回复：python3 ~/.muse-link/muse_link_client.py --machine ${slug} send <threadId> "<消息>" --wait 75`,
+          '- 若返回 approval_requested，请提醒主机主人在其本地电脑桌面点击确认，不要自行审批。',
+        ].join('\n')
+      }
+      const hostIp = ov?.tailnetIp || '<本机Tailscale-IP>'
+      const port = ov?.tailnetPort || 47616
+      return [
+        '请帮我把本 Muse 账号接入本机 Muse Hub v2（私有 Tailscale 直连，支持 DSH + Antigravity）：',
+        '1. 下载客户端并配对：',
+        'mkdir -p ~/.muse-link/credentials ~/.muse-link/state',
+        'curl -fsSL https://raw.githubusercontent.com/SmallCCQ/muse-agent-link/main/tools/muse_link_client.py -o ~/.muse-link/muse_link_client.py',
+        `python3 ~/.muse-link/muse_link_client.py --machine ${baseSlug} --host ${hostIp} --port ${port} pair --code ${ticket.code}`,
+        `python3 ~/.muse-link/muse_link_client.py --machine ${baseSlug} me`,
+        '',
+        '2. 常用命令（--agent 可选 antigravity 或 dsh）：',
+        `- 开窗/复用：python3 ~/.muse-link/muse_link_client.py --machine ${baseSlug} open --agent antigravity --window-key "topic:main" --title "远程对话"`,
+        `- 发送并等待回复：python3 ~/.muse-link/muse_link_client.py --machine ${baseSlug} send <threadId> "<消息>" --wait 75`,
+        `- 拉取事件：python3 ~/.muse-link/muse_link_client.py --machine ${baseSlug} poll --wait 0`,
+      ].join('\n')
     }
 
     function findSidebarFootArea() {
@@ -255,7 +338,7 @@ window.__ModuleLoader__.load({
         if (tickets.length > 0) {
           const secT = document.createElement('div')
           secT.className = 'mal-sec-title'
-          secT.textContent = '待配对票据（点击复制）'
+          secT.textContent = '待配对票据（可点码或一键复制指令）'
           panelEl.appendChild(secT)
           for (const t of tickets) {
             const row = document.createElement('div')
@@ -263,16 +346,28 @@ window.__ModuleLoader__.load({
             const code = document.createElement('span')
             code.className = 'mal-code'
             code.textContent = t.code
-            code.title = '点击复制配对码'
+            code.title = '点击仅复制 6 位配对码'
             code.onclick = (ev) => {
               ev.stopPropagation()
-              try { navigator.clipboard.writeText(t.code) } catch {}
+              copyToClipboard(t.code)
               code.textContent = `${t.code} ✓`
+              setTimeout(() => { code.textContent = t.code }, 1800)
             }
             const lbl = document.createElement('span')
+            lbl.className = 'mal-tkt-lbl'
             lbl.textContent = `${t.label} (${t.role === 'collaborator' ? '协作' : 'Owner'})`
-            lbl.style.opacity = '0.8'
-            row.append(code, lbl)
+            lbl.title = lbl.textContent
+            const btnCopy = document.createElement('button')
+            btnCopy.className = 'mal-btn-copy'
+            btnCopy.textContent = '复制指令'
+            btnCopy.title = '一键复制完整 Muse 接入指令发给对方'
+            btnCopy.onclick = (ev) => {
+              ev.stopPropagation()
+              copyToClipboard(buildOnboardingPrompt(t, data))
+              btnCopy.textContent = '已复制 ✓'
+              setTimeout(() => { btnCopy.textContent = '复制指令' }, 2000)
+            }
+            row.append(code, lbl, btnCopy)
             panelEl.appendChild(row)
           }
         }
@@ -310,6 +405,7 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({
               label: label.trim() || '协作账户',
               role: 'collaborator',
+              allowedAgents: ['dsh'],
               ...(ws.trim() ? { workspaceRoots: [ws.trim()] } : {}),
             }),
           })

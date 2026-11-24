@@ -4,7 +4,7 @@
 // - Collaborator-Only Funnel listener (127.0.0.1:47619): /v2/* collaborator-only (DSH-only, zero Owner/Admin surface)
 // - Legacy Loopback Compat listener (127.0.0.1:47615): /status (for AGY pill) + legacy daemon compat
 // UTF-8 without BOM. Pure Node.js built-ins.
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -137,6 +137,23 @@ function tailscaleIpv4() {
   }
   return null
 }
+
+let cachedTailnetDns = null
+function refreshTailnetDns() {
+  try {
+    execFile('tailscale', ['status', '--json'], { timeout: 4000, windowsHide: true }, (err, stdout) => {
+      if (err || !stdout) return
+      try {
+        const st = JSON.parse(stdout)
+        const dns = String(st?.Self?.DNSName || '').replace(/\.+$/, '').trim()
+        if (dns) cachedTailnetDns = dns
+      } catch {}
+    })
+  } catch {}
+}
+refreshTailnetDns()
+const tailnetDnsTimer = setInterval(refreshTailnetDns, 60_000)
+tailnetDnsTimer.unref?.()
 
 function formatStamp() {
   const d = new Date()
@@ -1450,6 +1467,8 @@ async function handleAdminAndInternal(req, res, url) {
       tailnetIp: tailscaleIpv4(),
       tailnetPort: TAILNET_PORT,
       tailnetListening: Boolean(tailnetServer?.listening),
+      tailnetDnsName: cachedTailnetDns,
+      funnelUrl: cachedTailnetDns ? `https://${cachedTailnetDns}` : null,
       collabPort: COLLAB_PORT > 0 ? COLLAB_PORT : null,
       collabListening: Boolean(collabServer?.listening),
       agents: buildPublicStatus().agents,
@@ -1807,6 +1826,7 @@ tailnetTimer.unref?.()
 function shutdown(sig) {
   log(`[hub] received ${sig}, shutting down`)
   clearInterval(tailnetTimer)
+  clearInterval(tailnetDnsTimer)
   agyAdapter.stop()
   removePidFileIfOurs()
   try { tailnetServer?.close() } catch {}

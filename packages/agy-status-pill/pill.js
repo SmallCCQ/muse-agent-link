@@ -54,6 +54,9 @@ background:rgba(255,255,255,.07);color:inherit;font-size:10.5px;cursor:pointer;t
 #muse-link-card .mlc-btn:hover{background:rgba(255,255,255,.16)}
 #muse-link-card .mlc-rev{margin-left:auto;padding:1px 5px;border-radius:4px;border:1px solid rgba(248,113,113,.38);
 background:transparent;color:#fca5a5;font-size:9.5px;cursor:pointer;flex:none}
+#muse-link-card .mlc-copy{margin-left:auto;padding:1px 6px;border-radius:4px;border:1px solid rgba(52,211,153,.42);
+background:rgba(52,211,153,.12);color:#6ee7b7;font-size:9.5px;cursor:pointer;flex:none;white-space:nowrap}
+#muse-link-card .mlc-copy:hover{background:rgba(52,211,153,.24)}
 `
 
   let mode = 'init'
@@ -177,6 +180,67 @@ background:transparent;color:#fca5a5;font-size:9.5px;cursor:pointer;flex:none}
     return el
   }
 
+  function copyToClipboard(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(text).catch(() => fallbackCopy(text))
+    } else {
+      fallbackCopy(text)
+    }
+  }
+
+  function fallbackCopy(text) {
+    try {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.left = '-9999px'
+      ta.style.top = '0'
+      document.body.appendChild(ta)
+      ta.focus()
+      ta.select()
+      document.execCommand('copy')
+      ta.remove()
+    } catch {}
+  }
+
+  function buildOnboardingPrompt(ticket, ov) {
+    const dnsName = String(ov?.tailnetDnsName || '').replace(/\.+$/, '')
+    const rawHost = dnsName ? dnsName.split('.')[0] : String(ov?.machine || 'pc')
+    const baseSlug = rawHost.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'pc'
+    if (ticket.role === 'collaborator') {
+      const slug = `${baseSlug}-collab`
+      const funnelUrl = ov?.funnelUrl || (dnsName ? `https://${dnsName}` : 'https://<本机Tailscale域名>')
+      return [
+        '请帮我连接一个受限的远程 DSH 协作工作区（公网 HTTPS 网关，无需 Tailscale）：',
+        '1. 下载客户端并配对：',
+        'mkdir -p ~/.muse-link/credentials ~/.muse-link/state',
+        'curl -fsSL https://raw.githubusercontent.com/SmallCCQ/muse-agent-link/main/tools/muse_link_client.py -o ~/.muse-link/muse_link_client.py',
+        `python3 ~/.muse-link/muse_link_client.py --machine ${slug} --url ${funnelUrl} pair --code ${ticket.code}`,
+        `python3 ~/.muse-link/muse_link_client.py --machine ${slug} me`,
+        '',
+        `2. 后续所有操作均使用 --machine ${slug}（仅允许 --agent dsh，不要使用 antigravity）：`,
+        `- 开窗/复用：python3 ~/.muse-link/muse_link_client.py --machine ${slug} open --agent dsh --window-key "topic:main" --title "协作对话"`,
+        `- 发送并等待回复：python3 ~/.muse-link/muse_link_client.py --machine ${slug} send <threadId> "<消息>" --wait 75`,
+        '- 若返回 approval_requested，请提醒主机主人在其本地电脑桌面点击确认，不要自行审批。',
+      ].join('\n')
+    }
+    const hostIp = ov?.tailnetIp || '<本机Tailscale-IP>'
+    const port = ov?.tailnetPort || 47616
+    return [
+      '请帮我把本 Muse 账号接入本机 Muse Hub v2（私有 Tailscale 直连，支持 DSH + Antigravity）：',
+      '1. 下载客户端并配对：',
+      'mkdir -p ~/.muse-link/credentials ~/.muse-link/state',
+      'curl -fsSL https://raw.githubusercontent.com/SmallCCQ/muse-agent-link/main/tools/muse_link_client.py -o ~/.muse-link/muse_link_client.py',
+      `python3 ~/.muse-link/muse_link_client.py --machine ${baseSlug} --host ${hostIp} --port ${port} pair --code ${ticket.code}`,
+      `python3 ~/.muse-link/muse_link_client.py --machine ${baseSlug} me`,
+      '',
+      '2. 常用命令（--agent 可选 antigravity 或 dsh）：',
+      `- 开窗/复用：python3 ~/.muse-link/muse_link_client.py --machine ${baseSlug} open --agent antigravity --window-key "topic:main" --title "远程对话"`,
+      `- 发送并等待回复：python3 ~/.muse-link/muse_link_client.py --machine ${baseSlug} send <threadId> "<消息>" --wait 75`,
+      `- 拉取事件：python3 ~/.muse-link/muse_link_client.py --machine ${baseSlug} poll --wait 0`,
+    ].join('\n')
+  }
+
   function render() {
     const el = ensureCard()
     el.setAttribute('data-mode', mode)
@@ -248,16 +312,28 @@ background:transparent;color:#fca5a5;font-size:9.5px;cursor:pointer;flex:none}
 
     const tickets = overview.tickets || []
     if (tickets.length > 0) {
-      det.appendChild(mk('div', 'mlc-sec', '待配对码（点击复制）'))
+      det.appendChild(mk('div', 'mlc-sec', '待配对码（可点码或一键复制指令）'))
       for (const t of tickets) {
         const row = mk('div', 'mlc-acc')
         const code = mk('span', 'mlc-code', t.code)
+        code.title = '点击仅复制 6 位配对码'
         code.onclick = (ev) => {
           ev.stopPropagation()
-          try { navigator.clipboard.writeText(t.code) } catch {}
+          copyToClipboard(t.code)
           code.textContent = `${t.code} ✓`
+          setTimeout(() => { code.textContent = t.code }, 1800)
         }
-        row.append(code, mk('span', 'mlc-albl', `${t.label} (${t.role === 'collaborator' ? '协作' : 'Owner'})`))
+        const lbl = mk('span', 'mlc-albl', `${t.label} (${t.role === 'collaborator' ? '协作' : 'Owner'})`)
+        lbl.title = lbl.textContent
+        const btnCopy = mk('button', 'mlc-copy', '复制指令')
+        btnCopy.title = '一键复制完整 Muse 接入指令发给对方'
+        btnCopy.onclick = (ev) => {
+          ev.stopPropagation()
+          copyToClipboard(buildOnboardingPrompt(t, overview))
+          btnCopy.textContent = '已复制 ✓'
+          setTimeout(() => { btnCopy.textContent = '复制指令' }, 2000)
+        }
+        row.append(code, lbl, btnCopy)
         det.appendChild(row)
       }
     }

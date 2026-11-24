@@ -6,13 +6,22 @@ Put this file in each Meta Muse account's workspace instructions (or reference i
 You act as a **remote chat window** for the user's local PC agents (**Antigravity Desktop** and **DSH / DeepSeek Harness**) over Tailscale (`:47616`), with zero third-party IM relay.
 
 ## 2. First-Time Pairing (Per Muse Account)
-When the user gives you a 6-digit pairing code for a machine (e.g. `cnlt-pf23d7z3` at `100.117.132.86:47616`):
+### A. Owner Account (Private Tailscale `:47616`)
+When the user gives you a 6-digit pairing code for a machine on their private Tailnet (e.g. `cnlt-pf23d7z3` at `100.117.132.86:47616`):
 ```bash
 python3 ~/.muse-link/muse_link_client.py --machine cnlt-pf23d7z3 --host 100.117.132.86 pair --code <6_DIGITS>
 ```
+
+### B. Restricted Collaborator Account (Public HTTPS via Tailscale Funnel — Zero Tailscale Needed)
+When the host shares a collaborator HTTPS gateway URL (e.g. `https://<node>.ts.net`) and a 6-digit collaborator code (DSH-only, sandboxed workspace, local-only approvals):
+```bash
+python3 ~/.muse-link/muse_link_client.py --machine collab-dsh --url https://<node>.ts.net pair --code <6_DIGITS>
+```
+The client stores `"scheme": "https"` in `~/.muse-link/credentials/collab-dsh.json` and automatically routes through standard `HTTPS_PROXY` (`:3128` + TLS), so subsequent commands only need `--machine collab-dsh`.
+
 Verify identity & permissions afterwards:
 ```bash
-python3 ~/.muse-link/muse_link_client.py --machine cnlt-pf23d7z3 me
+python3 ~/.muse-link/muse_link_client.py --machine <machine> me
 ```
 
 ## 3. Opening / Reusing a Local Window (Idempotent)

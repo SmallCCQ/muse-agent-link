@@ -25,6 +25,7 @@ const PY_CLIENT = path.join(ROOT, 'tools', 'muse_link_client.py')
 const TEST_ADMIN_PORT = 47717
 const TEST_LEGACY_PORT = 47715
 const TEST_TAILNET_PORT = 47716
+const TEST_COLLAB_PORT = 47719
 const BASE = `http://127.0.0.1:${TEST_ADMIN_PORT}`
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-hub-e2e-'))
@@ -116,6 +117,7 @@ const hubProc = spawn(process.execPath, [HUB_ENTRY], {
     MUSE_HUB_ADMIN_PORT: String(TEST_ADMIN_PORT),
     MUSE_HUB_LEGACY_PORT: String(TEST_LEGACY_PORT),
     MUSE_HUB_TAILNET_PORT: String(TEST_TAILNET_PORT),
+    MUSE_HUB_COLLAB_PORT: String(TEST_COLLAB_PORT),
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 })
@@ -353,7 +355,7 @@ try {
   // Live production Hub smoke test (read-only)
   const liveLegacy = await fetch('http://127.0.0.1:47615/status').then((r) => r.json())
   assert.equal(liveLegacy.ok, true)
-  assert.equal(liveLegacy.version, '2.0.0')
+  assert.match(String(liveLegacy.version), /^2\./)
   const liveOverview = await fetch('http://127.0.0.1:47617/admin/overview').then((r) => r.json())
   assert.equal(liveOverview.ok, true)
   assert.equal(liveOverview.agents.antigravity.available, true)

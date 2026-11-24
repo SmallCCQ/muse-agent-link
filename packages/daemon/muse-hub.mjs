@@ -1,6 +1,7 @@
 // Muse Hub v2 — Standalone Multi-Account Session Gateway for Antigravity Desktop & DSH
 // - Tailscale listener (<tailnet-ip>:47616): /v2/* + /api/muse-agent-link/* (v1 compat)
 // - Loopback Admin/Internal listener (127.0.0.1:47617): /admin/* + /internal/* + /v2/*
+// - Collaborator-Only Funnel listener (127.0.0.1:47619): /v2/* collaborator-only (DSH-only, zero Owner/Admin surface)
 // - Legacy Loopback Compat listener (127.0.0.1:47615): /status (for AGY pill) + legacy daemon compat
 // UTF-8 without BOM. Pure Node.js built-ins.
 import { spawn } from 'node:child_process'
@@ -28,6 +29,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const TAILNET_PORT = Number(process.env.MUSE_HUB_TAILNET_PORT || 47616)
 const ADMIN_PORT = Number(process.env.MUSE_HUB_ADMIN_PORT || 47617)
 const LEGACY_PORT = Number(process.env.MUSE_HUB_LEGACY_PORT || 47615)
+const COLLAB_PORT =
+  process.env.MUSE_HUB_COLLAB_PORT !== undefined ? Number(process.env.MUSE_HUB_COLLAB_PORT) : 47619
 const LOG_PATH = path.join(STATE_DIR, 'hub.log')
 const PID_PATH = path.join(STATE_DIR, 'hub.pid')
 const MAX_BODY_BYTES = 2 * 1024 * 1024
@@ -812,17 +815,55 @@ function buildPublicStatus() {
   }
 }
 
-async function handlePublicApi(req, res, url) {
+function buildCollabStatus() {
+  return {
+    ok: true,
+    plugin: 'muse-agent-link',
+    version: HUB_VERSION,
+    mode: 'collaborator-gateway',
+    channel: 'tailscale-funnel',
+    agents: {
+      dsh: {
+        available: isDshAvailable(),
+      },
+    },
+    time: new Date().toISOString(),
+  }
+}
+
+function extractClientIp(req, { trustProxy = false } = {}) {
+  const sockIp = normalizeIp(req.socket?.remoteAddress || '')
+  if (trustProxy && isLoopbackIp(sockIp)) {
+    const xff = String(req.headers['x-forwarded-for'] || '').trim()
+    if (xff) {
+      const first = normalizeIp(xff.split(',')[0])
+      if (first) return first
+    }
+    const xri = normalizeIp(req.headers['x-real-ip'] || '')
+    if (xri) return xri
+  }
+  return sockIp
+}
+
+async function handlePublicApi(req, res, url, { collabOnly = false } = {}) {
   const p = url.pathname
-  const remoteIp = normalizeIp(req.socket?.remoteAddress || '')
+  const remoteIp = extractClientIp(req, { trustProxy: collabOnly })
+
+  if (collabOnly) {
+    // Strictly allow only /v2/* on the Funnel collaborator gateway; hide v1, admin, internal & bundles.
+    if (!p.startsWith('/v2/') || p.startsWith('/v2/bundles/')) {
+      sendError(res, 404, 'not_found', 'Not found.')
+      return
+    }
+  }
 
   // ---- Unauthenticated routes ----
-  if ((p === '/v2/status' || p === '/api/muse-agent-link/status') && (req.method === 'GET' || req.method === 'HEAD')) {
-    sendJson(res, 200, buildPublicStatus())
+  if ((p === '/v2/status' || (!collabOnly && p === '/api/muse-agent-link/status')) && (req.method === 'GET' || req.method === 'HEAD')) {
+    sendJson(res, 200, collabOnly ? buildCollabStatus() : buildPublicStatus())
     return
   }
 
-  if ((p === '/v2/pair' || p === '/api/muse-agent-link/pair') && req.method === 'POST') {
+  if ((p === '/v2/pair' || (!collabOnly && p === '/api/muse-agent-link/pair')) && req.method === 'POST') {
     let body
     try {
       body = await readJsonBody(req)
@@ -833,19 +874,22 @@ async function handlePublicApi(req, res, url) {
     const result = store.redeemPairingTicket(body.code, {
       remoteIp,
       clientName: body.clientName,
+      requiredRole: collabOnly ? 'collaborator' : null,
+      allowIpPin: !collabOnly,
     })
     if (!result.ok) {
       sendError(res, result.status, result.code, result.message)
       return
     }
-    sendJson(res, 200, {
+    const pairResp = {
       ok: true,
       accountId: result.account.id,
       label: result.account.label,
       role: result.account.role,
       token: result.token,
-      machine: os.hostname(),
-    })
+    }
+    if (!collabOnly) pairResp.machine = os.hostname()
+    sendJson(res, 200, pairResp)
     return
   }
 
@@ -857,9 +901,23 @@ async function handlePublicApi(req, res, url) {
   }
   const account = auth.account
 
+  if (collabOnly && account.role !== 'collaborator') {
+    store.audit('auth.collab_gateway_rejected_owner', { accountId: account.id, remoteIp })
+    sendError(
+      res,
+      403,
+      'forbidden_role',
+      'Owner tokens are not accepted on the collaborator gateway; use private tailnet :47616.'
+    )
+    return
+  }
+
   // ---- v2 canonical API ----
   if (p === '/v2/me' && req.method === 'GET') {
-    sendJson(res, 200, { ok: true, machine: os.hostname(), account: store.accountPublicView(account) })
+    const meResp = { ok: true, account: store.accountPublicView(account) }
+    if (collabOnly) meResp.mode = 'collaborator-gateway'
+    else meResp.machine = os.hostname()
+    sendJson(res, 200, meResp)
     return
   }
 
@@ -947,13 +1005,20 @@ async function handlePublicApi(req, res, url) {
     return
   }
 
-  if ((p === '/v2/threads' || p === '/api/muse-agent-link/threads') && req.method === 'POST') {
+  if ((p === '/v2/threads' || (!collabOnly && p === '/api/muse-agent-link/threads')) && req.method === 'POST') {
     let body
     try {
       body = await readJsonBody(req)
     } catch {
       sendError(res, 400, 'bad_request', 'Invalid JSON body.')
       return
+    }
+    if (collabOnly) {
+      const requestedAgent = body.agent || account.defaultAgent || 'dsh'
+      if (requestedAgent !== 'dsh') {
+        sendError(res, 403, 'forbidden_role', 'Only DSH agent is exposed on the collaborator gateway.')
+        return
+      }
     }
     try {
       const { status, reused, binding } = await handleCreateThread(account, body)
@@ -1385,6 +1450,8 @@ async function handleAdminAndInternal(req, res, url) {
       tailnetIp: tailscaleIpv4(),
       tailnetPort: TAILNET_PORT,
       tailnetListening: Boolean(tailnetServer?.listening),
+      collabPort: COLLAB_PORT > 0 ? COLLAB_PORT : null,
+      collabListening: Boolean(collabServer?.listening),
       agents: buildPublicStatus().agents,
       wakeConfig: wake.getPublicConfig(),
       accounts,
@@ -1606,6 +1673,7 @@ async function handleLegacyDaemon(req, res, url) {
       onlineAccounts: accounts.filter((a) => a.online).length,
       dshAvailable: isDshAvailable(),
       tailnetListening: Boolean(tailnetServer?.listening),
+      collabListening: Boolean(collabServer?.listening),
       time: new Date().toISOString(),
     })
     return
@@ -1663,6 +1731,25 @@ legacyServer.on('error', (err) => {
 legacyServer.listen(LEGACY_PORT, '127.0.0.1', () => {
   log(`[hub] legacy status compat listening on http://127.0.0.1:${LEGACY_PORT}`)
 })
+
+let collabServer = null
+if (Number.isInteger(COLLAB_PORT) && COLLAB_PORT > 0) {
+  collabServer = http.createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url || '/', `http://127.0.0.1:${COLLAB_PORT}`)
+      await handlePublicApi(req, res, url, { collabOnly: true })
+    } catch (err) {
+      log(`[collab] error: ${err?.message || err}`)
+      sendError(res, err.status || 500, err.code || 'internal', String(err?.message || err))
+    }
+  })
+  collabServer.on('error', (err) => {
+    log(`[collab] port ${COLLAB_PORT} listen warning: ${err?.message || err}`)
+  })
+  collabServer.listen(COLLAB_PORT, '127.0.0.1', () => {
+    log(`[hub] collaborator-only gateway listening on http://127.0.0.1:${COLLAB_PORT} (/v2/* collaborator-only, Tailscale Funnel backend)`)
+  })
+}
 
 let tailnetServer = null
 let tailnetBoundIp = null
@@ -1723,6 +1810,7 @@ function shutdown(sig) {
   agyAdapter.stop()
   removePidFileIfOurs()
   try { tailnetServer?.close() } catch {}
+  try { collabServer?.close() } catch {}
   try { adminServer.close() } catch {}
   try { legacyServer.close() } catch {}
   process.exit(0)

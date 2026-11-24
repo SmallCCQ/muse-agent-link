@@ -2,6 +2,22 @@
 
 All notable changes to `muse-agent-link` are documented in this file.
 
+## [2.1.0] - 2026-11-24 — Collaborator-Only Funnel Gateway (`:47619`) & Native HTTPS Client
+
+### Security & Network Isolation (Zero-Tailscale Collaborator Access)
+- **Dedicated collaborator-only loopback listener (`127.0.0.1:47619`, `packages/daemon/muse-hub.mjs`)**: Designed to be fronted by **Tailscale Funnel** (`tailscale funnel --bg 47619`) so external restricted collaborators can connect over public HTTPS without ever joining the host's private Tailnet.
+  - **Strict surface minimization**: Only `/v2/*` collaborator routes are reachable; `/admin/*`, `/internal/*`, `/api/muse-agent-link/*`, `/v2/bundles/*`, and `/status` all return `404`.
+  - **Zero Owner exposure**: Both Owner pairing tickets (`POST /v2/pair`, without consuming the ticket) and Owner Bearer tokens (`Authorization: Bearer ...`) are rejected with `403 forbidden_role` on `:47619`.
+  - **Zero host/AGY fingerprint leakage**: `GET /v2/status` on `:47619` returns a minimal `collaborator-gateway` payload (`agents.dsh.available` only — no Windows hostname, no `accountCount`, no Antigravity info).
+  - **Two-layer DSH-only enforcement**: `store.mjs` now defaults collaborator pairing tickets to `allowedAgents: ['dsh']`, and `:47619` enforces `agent === 'dsh'` at the gateway layer as defense-in-depth, alongside `realpathSync` workspace jail, forced DSH `preset`, and `approvalPolicy: "local_only"`.
+  - **Rotating cloud NAT IP compatibility + per-IP brute-force protection**: Reads `X-Forwarded-For` from loopback Funnel reverse proxy for per-client pairing rate-limiting (`429`) and audit logs while disabling Tailnet CGNAT IP pinning (`enforceIpPin: false`) for Funnel-paired collaborators (`isTailnetCgnatIp` guard in `packages/daemon/store.mjs`).
+
+### Muse-Side HTTPS Client & Automated Verification
+- **HTTPS + standard egress proxy support (`tools/muse_link_client.py` + `tools/MUSE_LINK_SKILL.md`)**: Added `--url https://<node>.ts.net`, `--https`, and `--ca-file` flags, persisting `"scheme": "https"` in per-machine credential files. Automatically routes `https://` targets through standard `HTTPS_PROXY` (`:3128` `HTTP CONNECT` + TLS SNI verification) while keeping private `http://<tailnet-ip>:47616` traffic on Meta Hatch's `:3130` tunnel proxy unchanged.
+- **Collaborator gateway & TLS E2E test suite (`tests/collab-gateway-test.mjs`)**: Added 7 new E2E tests (total **26/26** across all 4 suites) covering minimal status, 404 route hiding, Owner ticket/token blocking, DSH-only & sandbox jail, per-IP `X-Forwarded-For` rate limiting, and real TLS + SNI + simulated standard `HTTPS_PROXY` `CONNECT` end-to-end execution via `muse_link_client.py`.
+
+---
+
 ## [2.0.0] - 2026-11-23 — Muse Hub v2 (Multi-Account Bidirectional Session Window)
 
 ### Architecture & Decoupling

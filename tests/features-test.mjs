@@ -14,6 +14,7 @@ const HUB_ENTRY = path.join(ROOT, 'packages', 'daemon', 'muse-hub.mjs')
 const TEST_ADMIN_PORT = 47917
 const TEST_LEGACY_PORT = 47915
 const TEST_TAILNET_PORT = 47916
+const TEST_COLLAB_PORT = 47919
 const BASE = `http://127.0.0.1:${TEST_ADMIN_PORT}`
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-upgrades-'))
@@ -54,6 +55,7 @@ const hubProc = spawn(process.execPath, [HUB_ENTRY], {
     MUSE_HUB_ADMIN_PORT: String(TEST_ADMIN_PORT),
     MUSE_HUB_LEGACY_PORT: String(TEST_LEGACY_PORT),
     MUSE_HUB_TAILNET_PORT: String(TEST_TAILNET_PORT),
+    MUSE_HUB_COLLAB_PORT: String(TEST_COLLAB_PORT),
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 })

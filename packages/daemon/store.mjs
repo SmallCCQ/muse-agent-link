@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-export const HUB_VERSION = '2.0.0'
+export const HUB_VERSION = '2.1.0'
 export const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 export const STATE_DIR = process.env.MUSE_LINK_STATE_DIR || path.join(DSH_HOME, 'muse-agent-link')
 export const DEFAULT_WORKSPACE = path.join(STATE_DIR, 'workspace')
@@ -44,6 +44,18 @@ export function normalizeIp(raw) {
 export function isLoopbackIp(ip) {
   const n = normalizeIp(ip)
   return n === '127.0.0.1' || n === '::1' || n === 'localhost'
+}
+
+export function isTailnetCgnatIp(ip) {
+  const n = normalizeIp(ip)
+  const parts = n.split('.').map(Number)
+  return (
+    parts.length === 4 &&
+    parts[0] === 100 &&
+    parts[1] >= 64 &&
+    parts[1] <= 127 &&
+    parts.every((p) => Number.isInteger(p) && p >= 0 && p <= 255)
+  )
 }
 
 export function normalizeTextForEcho(text) {
@@ -413,11 +425,14 @@ export class HubStore {
     if (patch.approvalPolicy === 'remote_or_local' || patch.approvalPolicy === 'local_only') {
       acc.approvalPolicy = acc.role === 'collaborator' ? 'local_only' : patch.approvalPolicy
     }
-    if (typeof patch.enforceIpPin === 'boolean') {
-      acc.enforceIpPin = acc.role === 'collaborator' ? true : patch.enforceIpPin
-    }
     if (Array.isArray(patch.pinnedTailnetIps)) {
       acc.pinnedTailnetIps = patch.pinnedTailnetIps.map((x) => normalizeIp(x)).filter(Boolean)
+    }
+    if (typeof patch.enforceIpPin === 'boolean') {
+      acc.enforceIpPin =
+        acc.role === 'collaborator' && Array.isArray(acc.pinnedTailnetIps) && acc.pinnedTailnetIps.length > 0
+          ? true
+          : patch.enforceIpPin
     }
     if (patch.forcedPreset !== undefined) {
       acc.forcedPreset = patch.forcedPreset ? String(patch.forcedPreset) : null
@@ -487,10 +502,11 @@ export class HubStore {
     const label =
       (typeof opts.label === 'string' && opts.label.trim().slice(0, 48)) ||
       (role === 'collaborator' ? '协作账户' : `Muse·账号${this.accounts.size + 1}`)
+    const defaultAllowed = role === 'collaborator' ? ['dsh'] : ['dsh', 'antigravity']
     const allowedAgents = Array.isArray(opts.allowedAgents)
       ? opts.allowedAgents.filter((a) => a === 'dsh' || a === 'antigravity')
-      : ['dsh', 'antigravity']
-    const finalAgents = allowedAgents.length > 0 ? allowedAgents : ['dsh', 'antigravity']
+      : defaultAllowed
+    const finalAgents = allowedAgents.length > 0 ? allowedAgents : defaultAllowed
 
     let workspaceRoots
     if (role === 'collaborator') {
@@ -546,7 +562,7 @@ export class HubStore {
     return existed
   }
 
-  redeemPairingTicket(code, { remoteIp, clientName } = {}) {
+  redeemPairingTicket(code, { remoteIp, clientName, requiredRole = null, allowIpPin = true } = {}) {
     this.pruneExpiredTickets()
     const ip = normalizeIp(remoteIp || 'unknown')
     const now = Date.now()
@@ -588,6 +604,21 @@ export class HubStore {
       }
     }
 
+    if (requiredRole && matched.role !== requiredRole) {
+      this.audit('pairing.role_rejected', {
+        ticketId: matched.ticketId,
+        ticketRole: matched.role,
+        requiredRole,
+        remoteIp: ip,
+      })
+      return {
+        ok: false,
+        status: 403,
+        code: 'forbidden_role',
+        message: `This gateway only accepts ${requiredRole} pairing codes.`,
+      }
+    }
+
     this.pairFailures.delete(ip)
     matched.used = true
     this.tickets.delete(matched.ticketId)
@@ -595,7 +626,8 @@ export class HubStore {
 
     const token = crypto.randomBytes(32).toString('hex')
     const accountId = `acc_${matched.role === 'collaborator' ? 'collab' : 'owner'}_${crypto.randomBytes(4).toString('hex')}`
-    const pinnedTailnetIps = ip && !isLoopbackIp(ip) && ip !== 'unknown' ? [ip] : []
+    const canPin = Boolean(allowIpPin) && Boolean(ip) && !isLoopbackIp(ip) && ip !== 'unknown' && isTailnetCgnatIp(ip)
+    const pinnedTailnetIps = canPin ? [ip] : []
     const acc = {
       id: accountId,
       label: matched.label,
@@ -603,7 +635,7 @@ export class HubStore {
       status: 'active',
       tokenHash: sha256Hex(token),
       pinnedTailnetIps,
-      enforceIpPin: matched.role === 'collaborator' ? pinnedTailnetIps.length > 0 : Boolean(matched.enforceIpPin),
+      enforceIpPin: canPin && (matched.role === 'collaborator' || Boolean(matched.enforceIpPin)),
       allowedAgents: matched.allowedAgents,
       defaultAgent: matched.defaultAgent,
       workspaceRoots: matched.workspaceRoots,

@@ -2,9 +2,11 @@
 """Muse Agent Link v2 — Zero-dependency Python3 client for Meta Muse VMs.
 
 Features:
-  - Routes over Meta Hatch Tailscale tunnel proxy (HTTPS_PROXY host :3130 HTTP CONNECT)
-    or direct TCP when HTTPS_PROXY is absent / --direct is set.
-  - Strict bounded long-poll slices (<= 18s) to stay safely under Hatch's ~25s proxy cutoff.
+  - Private Tailnet mode (http://<tailnet-ip>:47616): routes over Meta Hatch Tailscale
+    tunnel proxy (HTTPS_PROXY host :3130 HTTP CONNECT) or direct TCP (--direct).
+  - Public Collaborator Gateway mode (--url https://<node>.ts.net): routes over standard
+    HTTPS_PROXY (e.g. :3128 HTTP CONNECT + TLS SNI) or direct TLS, zero Tailscale needed.
+  - Strict bounded long-poll slices (<= 18s) to stay safely under proxy cutoffs.
   - Account-level multiplexed event cursor persisted per machine (~/.muse-link/state/).
   - Idempotent windowKey reuse so Muse never spams duplicate local DSH/AGY sessions.
   - Auto-reads legacy ../.device-token-<machine> if present for seamless v1 -> v2 upgrade.
@@ -15,6 +17,7 @@ import json
 import os
 import pathlib
 import socket
+import ssl
 import sys
 import time
 import urllib.parse
@@ -43,7 +46,16 @@ def state_path(machine: str) -> pathlib.Path:
     return STATE_DIR / f"{machine}.json"
 
 
-def load_cred(machine: str, host_override=None, port_override=None):
+def parse_endpoint_url(url_str: str):
+    u = urllib.parse.urlparse(url_str.strip())
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ValueError(f"Invalid --url (expected http(s)://host[:port]): {url_str!r}")
+    port = u.port or (443 if u.scheme == "https" else 80)
+    base_path = u.path.rstrip("/") if u.path and u.path != "/" else ""
+    return u.scheme, u.hostname, int(port), base_path
+
+
+def load_cred(machine: str, host_override=None, port_override=None, url_override=None, https_override=False):
     p = cred_path(machine)
     data = {}
     if p.exists():
@@ -60,17 +72,45 @@ def load_cred(machine: str, host_override=None, port_override=None):
                 data = {"token": cand.read_text(encoding="utf-8").strip()}
                 break
 
+    url_scheme = url_host = url_port = url_base_path = None
+    url_raw = url_override or os.environ.get("MUSE_LINK_URL")
+    if url_raw:
+        url_scheme, url_host, url_port, url_base_path = parse_endpoint_url(url_raw)
+
     default_host, default_port = DEFAULT_MACHINES.get(machine, ("127.0.0.1", 47616))
-    host = host_override or os.environ.get("MUSE_LINK_HOST") or data.get("host") or default_host
-    port = int(port_override or os.environ.get("MUSE_LINK_PORT") or data.get("port") or default_port)
+    stored_scheme = data.get("scheme") or "http"
+    scheme = (
+        url_scheme
+        or ("https" if https_override else None)
+        or os.environ.get("MUSE_LINK_SCHEME")
+        or stored_scheme
+        or "http"
+    ).lower()
+    host = host_override or url_host or os.environ.get("MUSE_LINK_HOST") or data.get("host") or default_host
+    stored_port = data.get("port") if stored_scheme == scheme else None
+    fallback_port = 443 if scheme == "https" else default_port
+    port = int(port_override or url_port or os.environ.get("MUSE_LINK_PORT") or stored_port or fallback_port)
+    base_path = url_base_path if url_base_path is not None else (data.get("basePath") or "")
     return {
+        "scheme": scheme,
         "host": host,
         "port": port,
+        "basePath": base_path,
         "token": data.get("token"),
         "accountId": data.get("accountId"),
         "label": data.get("label"),
         "role": data.get("role"),
     }
+
+
+def cred_for_args(args):
+    return load_cred(
+        args.machine,
+        host_override=args.host,
+        port_override=args.port,
+        url_override=args.url,
+        https_override=args.https,
+    )
 
 
 def save_cred(machine: str, info: dict):
@@ -135,12 +175,22 @@ def http_request(
     timeout: float = 25.0,
     direct: bool = False,
     raw_response: bool = False,
+    scheme: str = "http",
+    base_path: str = "",
+    ca_file: str = None,
 ):
-    proxy_url = "" if direct else os.environ.get("HTTPS_PROXY", "")
+    scheme = (scheme or "http").lower()
+    full_path = f"{base_path.rstrip('/')}{path}" if base_path else path
+    proxy_url = "" if direct else (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "")
     if proxy_url and host not in ("127.0.0.1", "localhost", "::1"):
         u = urllib.parse.urlparse(proxy_url)
-        tunnel_port = int(os.environ.get("MUSE_TUNNEL_PROXY_PORT", "3130"))
-        s = socket.create_connection((u.hostname, tunnel_port), timeout=min(timeout, 20.0))
+        if scheme == "https":
+            # Standard public internet HTTPS egress proxy (e.g. :3128), NOT Hatch's :3130 tailnet tunnel.
+            proxy_port = int(os.environ.get("MUSE_PUBLIC_PROXY_PORT") or u.port or (443 if u.scheme == "https" else 3128))
+        else:
+            # Private Tailscale tunnel proxy on Meta Hatch (:3130).
+            proxy_port = int(os.environ.get("MUSE_TUNNEL_PROXY_PORT", "3130"))
+        s = socket.create_connection((u.hostname, proxy_port), timeout=min(timeout, 20.0))
         auth_line = ""
         if u.username is not None:
             auth = base64.b64encode(f"{u.username}:{u.password or ''}".encode()).decode()
@@ -162,13 +212,26 @@ def http_request(
     else:
         s = socket.create_connection((host, port), timeout=min(timeout, 20.0))
 
+    if scheme == "https":
+        try:
+            ca = ca_file or os.environ.get("MUSE_LINK_CA_FILE") or None
+            ctx = ssl.create_default_context(cafile=ca)
+            s = ctx.wrap_socket(s, server_hostname=host)
+        except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
+            raise
+
     try:
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else b""
+        host_header = host if ((scheme == "https" and port == 443) or (scheme == "http" and port == 80)) else f"{host}:{port}"
         headers = [
-            f"{method} {path} HTTP/1.1",
-            f"Host: {host}:{port}",
+            f"{method} {full_path} HTTP/1.1",
+            f"Host: {host_header}",
             "Connection: close",
-            "User-Agent: muse-link-client/2.0",
+            "User-Agent: muse-link-client/2.1",
         ]
         if body is not None:
             headers.append("Content-Type: application/json; charset=utf-8")
@@ -185,8 +248,12 @@ def http_request(
                 if not c:
                     break
                 chunks.append(c)
-            except socket.timeout:
+            except (socket.timeout, TimeoutError):
                 break
+            except ssl.SSLEOFError:
+                if chunks:
+                    break
+                raise
         out = b"".join(chunks)
     finally:
         try:
@@ -195,7 +262,7 @@ def http_request(
             pass
 
     if b"\r\n\r\n" not in out:
-        raise RuntimeError(f"Incomplete HTTP response from {host}:{port} ({len(out)} bytes)")
+        raise RuntimeError(f"Incomplete HTTP response from {scheme}://{host}:{port} ({len(out)} bytes)")
     head_bytes, _, body_bytes = out.partition(b"\r\n\r\n")
     first_line = head_bytes.split(b"\r\n", 1)[0]
     parts = first_line.split(b" ")
@@ -212,6 +279,23 @@ def http_request(
         return status, {"raw": body_bytes.decode("utf-8", errors="replace")}
 
 
+def cred_request(cred: dict, args, method: str, path: str, body=None, token=None, timeout: float = 25.0, raw_response: bool = False):
+    return http_request(
+        cred["host"],
+        cred["port"],
+        method,
+        path,
+        body=body,
+        token=token,
+        timeout=timeout,
+        direct=args.direct,
+        raw_response=raw_response,
+        scheme=cred.get("scheme", "http"),
+        base_path=cred.get("basePath", ""),
+        ca_file=args.ca_file,
+    )
+
+
 def require_token(cred: dict):
     if not cred.get("token"):
         print(json.dumps({"error": {"code": "not_paired", "message": "No token found for this machine. Run `pair` first."}}, ensure_ascii=False))
@@ -220,30 +304,31 @@ def require_token(cred: dict):
 
 
 def cmd_status(args):
-    cred = load_cred(args.machine, args.host, args.port)
-    status, data = http_request(cred["host"], cred["port"], "GET", "/v2/status", direct=args.direct)
+    cred = cred_for_args(args)
+    status, data = cred_request(cred, args, "GET", "/v2/status")
     print(json.dumps({"http": status, **data}, ensure_ascii=False, indent=2))
 
 
 def cmd_pair(args):
-    cred = load_cred(args.machine, args.host, args.port)
+    cred = cred_for_args(args)
     payload = {"code": args.code}
     if args.client_name:
         payload["clientName"] = args.client_name
-    status, data = http_request(cred["host"], cred["port"], "POST", "/v2/pair", payload, direct=args.direct)
+    status, data = cred_request(cred, args, "POST", "/v2/pair", body=payload)
     if status == 200 and data.get("token"):
-        save_cred(
-            args.machine,
-            {
-                "host": cred["host"],
-                "port": cred["port"],
-                "accountId": data.get("accountId"),
-                "label": data.get("label"),
-                "role": data.get("role"),
-                "token": data["token"],
-                "machine": data.get("machine", args.machine),
-            },
-        )
+        saved = {
+            "scheme": cred["scheme"],
+            "host": cred["host"],
+            "port": cred["port"],
+            "accountId": data.get("accountId"),
+            "label": data.get("label"),
+            "role": data.get("role"),
+            "token": data["token"],
+            "machine": data.get("machine", args.machine),
+        }
+        if cred.get("basePath"):
+            saved["basePath"] = cred["basePath"]
+        save_cred(args.machine, saved)
         redacted = {k: v for k, v in data.items() if k != "token"}
         redacted["tokenSavedTo"] = str(cred_path(args.machine))
         print(json.dumps({"http": status, **redacted}, ensure_ascii=False, indent=2))
@@ -253,14 +338,14 @@ def cmd_pair(args):
 
 
 def cmd_me(args):
-    cred = load_cred(args.machine, args.host, args.port)
+    cred = cred_for_args(args)
     tok = require_token(cred)
-    status, data = http_request(cred["host"], cred["port"], "GET", "/v2/me", token=tok, direct=args.direct)
+    status, data = cred_request(cred, args, "GET", "/v2/me", token=tok)
     print(json.dumps({"http": status, **data}, ensure_ascii=False, indent=2))
 
 
 def cmd_open(args):
-    cred = load_cred(args.machine, args.host, args.port)
+    cred = cred_for_args(args)
     tok = require_token(cred)
     body = {}
     if args.agent:
@@ -275,7 +360,7 @@ def cmd_open(args):
         body["model"] = args.model
     if args.preset:
         body["preset"] = args.preset
-    status, data = http_request(cred["host"], cred["port"], "POST", "/v2/threads", body, token=tok, direct=args.direct)
+    status, data = cred_request(cred, args, "POST", "/v2/threads", body=body, token=tok)
     if status in (200, 201) and data.get("thread") and args.window_key:
         st = load_state(args.machine)
         st["windows"][args.window_key] = {
@@ -287,35 +372,34 @@ def cmd_open(args):
 
 
 def cmd_threads(args):
-    cred = load_cred(args.machine, args.host, args.port)
+    cred = cred_for_args(args)
     tok = require_token(cred)
     qs = f"?scope={urllib.parse.quote(args.scope)}"
     if args.include_closed:
         qs += "&includeClosed=1"
-    status, data = http_request(cred["host"], cred["port"], "GET", f"/v2/threads{qs}", token=tok, direct=args.direct)
+    status, data = cred_request(cred, args, "GET", f"/v2/threads{qs}", token=tok)
     print(json.dumps({"http": status, **data}, ensure_ascii=False, indent=2))
 
 
 def cmd_thread(args):
-    cred = load_cred(args.machine, args.host, args.port)
+    cred = cred_for_args(args)
     tok = require_token(cred)
-    status, data = http_request(cred["host"], cred["port"], "GET", f"/v2/threads/{urllib.parse.quote(args.thread_id)}", token=tok, direct=args.direct)
+    status, data = cred_request(cred, args, "GET", f"/v2/threads/{urllib.parse.quote(args.thread_id)}", token=tok)
     print(json.dumps({"http": status, **data}, ensure_ascii=False, indent=2))
 
 
 def cmd_send(args):
-    cred = load_cred(args.machine, args.host, args.port)
+    cred = cred_for_args(args)
     tok = require_token(cred)
     st = load_state(args.machine)
     body = {"text": args.text, "mode": args.mode}
-    status, data = http_request(
-        cred["host"],
-        cred["port"],
+    status, data = cred_request(
+        cred,
+        args,
         "POST",
         f"/v2/threads/{urllib.parse.quote(args.thread_id)}/messages",
-        body,
+        body=body,
         token=tok,
-        direct=args.direct,
     )
     if status not in (200, 202) or args.wait <= 0:
         print(json.dumps({"http": status, **data}, ensure_ascii=False, indent=2))
@@ -335,14 +419,13 @@ def cmd_send(args):
         slice_wait = min(MAX_SLICE_SEC, remaining)
         qs = f"?cursor={cursor}&wait={slice_wait}&threadId={urllib.parse.quote(args.thread_id)}"
         try:
-            ps, pdata = http_request(
-                cred["host"],
-                cred["port"],
+            ps, pdata = cred_request(
+                cred,
+                args,
                 "GET",
                 f"/v2/events{qs}",
                 token=tok,
                 timeout=slice_wait + 6.0,
-                direct=args.direct,
             )
         except Exception:
             time.sleep(1.0)
@@ -431,7 +514,7 @@ def cmd_send(args):
 
 
 def cmd_poll(args):
-    cred = load_cred(args.machine, args.host, args.port)
+    cred = cred_for_args(args)
     tok = require_token(cred)
     st = load_state(args.machine)
     cursor = args.cursor if args.cursor is not None else int(st.get("cursor", 0))
@@ -439,14 +522,13 @@ def cmd_poll(args):
     qs = f"?cursor={cursor}&wait={wait_sec}"
     if args.thread_id:
         qs += f"&threadId={urllib.parse.quote(args.thread_id)}"
-    status, data = http_request(
-        cred["host"],
-        cred["port"],
+    status, data = cred_request(
+        cred,
+        args,
         "GET",
         f"/v2/events{qs}",
         token=tok,
         timeout=wait_sec + 6.0,
-        direct=args.direct,
     )
     if status == 200 and isinstance(data, dict) and not args.no_commit:
         new_cursor = int(data.get("cursor", cursor))
@@ -457,22 +539,21 @@ def cmd_poll(args):
 
 
 def cmd_simple_post(args, endpoint_fn, body=None):
-    cred = load_cred(args.machine, args.host, args.port)
+    cred = cred_for_args(args)
     tok = require_token(cred)
-    status, data = http_request(cred["host"], cred["port"], "POST", endpoint_fn(args), body or {}, token=tok, direct=args.direct)
+    status, data = cred_request(cred, args, "POST", endpoint_fn(args), body=body or {}, token=tok)
     print(json.dumps({"http": status, **data}, ensure_ascii=False, indent=2))
 
 
 def cmd_fetch_token(args):
-    cred = load_cred(args.machine, args.host, args.port)
+    cred = cred_for_args(args)
     tok = require_token(cred)
-    status, raw = http_request(
-        cred["host"],
-        cred["port"],
+    status, raw = cred_request(
+        cred,
+        args,
         "GET",
         f"/v2/files/{urllib.parse.quote(args.file_token)}",
         token=tok,
-        direct=args.direct,
         raw_response=True,
     )
     if status != 200:
@@ -485,10 +566,10 @@ def cmd_fetch_token(args):
 
 
 def cmd_fetch_file(args):
-    cred = load_cred(args.machine, args.host, args.port)
+    cred = cred_for_args(args)
     tok = require_token(cred)
     body = {"workspace": args.workspace, "path": args.path, "encoding": "base64" if args.out else "utf8"}
-    status, data = http_request(cred["host"], cred["port"], "POST", "/v2/files/fetch", body, token=tok, direct=args.direct)
+    status, data = cred_request(cred, args, "POST", "/v2/files/fetch", body=body, token=tok)
     if status == 200 and args.out and data.get("base64"):
         raw = base64.b64decode(data["base64"])
         out_path = pathlib.Path(args.out)
@@ -500,9 +581,9 @@ def cmd_fetch_file(args):
 
 
 def cmd_self_update(args):
-    cred = load_cred(args.machine, args.host, args.port)
+    cred = cred_for_args(args)
     tok = require_token(cred)
-    status, raw = http_request(cred["host"], cred["port"], "GET", "/v2/client.py", token=tok, direct=args.direct, raw_response=True)
+    status, raw = cred_request(cred, args, "GET", "/v2/client.py", token=tok, raw_response=True)
     if status != 200 or b"def http_request" not in raw:
         print(json.dumps({"http": status, "error": "Unexpected client.py payload"}, ensure_ascii=False))
         sys.exit(1)
@@ -520,9 +601,12 @@ def cmd_self_update(args):
 def build_parser():
     p = argparse.ArgumentParser(description="Muse Agent Link v2 client")
     p.add_argument("--machine", default=os.environ.get("MUSE_LINK_MACHINE", "cnlt-pf23d7z3"))
+    p.add_argument("--url", default=None, help="Full endpoint URL, e.g. https://node.tailnet.ts.net (for Funnel collaborator gateway)")
+    p.add_argument("--https", action="store_true", help="Use HTTPS (TLS, default port 443) over standard egress proxy")
+    p.add_argument("--ca-file", default=None, help="Optional custom CA bundle path for TLS verification")
     p.add_argument("--host", default=None)
     p.add_argument("--port", type=int, default=None)
-    p.add_argument("--direct", action="store_true", help="Bypass HTTPS_PROXY (direct TCP)")
+    p.add_argument("--direct", action="store_true", help="Bypass HTTPS_PROXY (direct TCP/TLS)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status").set_defaults(func=cmd_status)
